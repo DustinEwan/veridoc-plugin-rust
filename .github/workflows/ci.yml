@@ -32,19 +32,19 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
-  # The example names this repository's release binary directly, and its judge is a script
-  # the repository ships so that no model call happens in CI. A green check is the
-  # end-to-end gate: collect, resolve, bind, bivalence, run, and the report.
+  # The example names this repository's release binary directly and ships no `judge`, so no model
+  # call happens in CI and the semantic stage reports itself as not run. A green check is still the
+  # end-to-end gate for the deterministic stage: collect, resolve, bind, bivalence, run, and the
+  # report. The model-backed checks run locally, where the verdict cache replays the sections that
+  # did not change; a cold CI checkout has neither a warm verdict cache nor a warm harness build,
+  # so every run would re-judge every section, and a model answer would make the gate
+  # non-reproducible.
   example:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
 
       - name: Build the plugin the example points at
         run: cargo build --release

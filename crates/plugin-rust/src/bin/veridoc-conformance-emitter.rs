@@ -8,8 +8,8 @@
 //! install-plugin`, `veridoc validate-plugin`, and the mechanism's suite-program mode all render
 //! through here, so a fixture that fails locally fails the install too.
 //!
-//! Two choices are specific to Rust and are the reason this file is not a translation of the
-//! Node plugin's emitter:
+//! Three choices are specific to Rust and are the reason this file is not a translation of
+//! the Node plugin's emitter:
 //!
 //! - The fixture's `Cargo.toml` has no dependencies. The plugin builds the fixture's harness with
 //!   `cargo build --release` inside the suite's `run` deadline (`harness_binary` in `run.rs`), so
@@ -22,6 +22,9 @@
 //!   contains a `satisfies` leaf, because the plugin does not evaluate Rust predicates; the Node
 //!   plugin's negatives are static-analysis cases that would all be answered the same way here
 //!   and prove nothing.
+//! - The fixture declares one `pub` item and one private one, in the same file. `surface` answers
+//!   the first and refuses the second, and `derivable` reads its facts out of the `pub` function's
+//!   own header, so the two answers the suite checks are both decided by text the emitter owns.
 
 use std::error::Error;
 use std::fs;
@@ -43,6 +46,32 @@ const FIXTURE: &str = "fixtures/empty-directory";
 /// The harness binary the rendered project ships.
 const HARNESS: &str = "veridoc-harness";
 
+/// The citation store the manifest names, the log that answers it, and the turn the suite asks
+/// for. A `file` store is a directory of `<id>.jsonl` logs read against the project root.
+const CITATION_STORE: &str = "session";
+const CITATION_PATH: &str = ".veridoc/citations";
+const CITATION_ID: &str = "probe-refusal";
+const CITATION_TURN: u32 = 1;
+/// The one turn of that log. `cite` answers its `text`, and the suite fails a resolved citation
+/// whose text is empty, so the sentence here is the answer the rule reads.
+const CITATION_LOG: &str = concat!(
+    "{\"turn\": 1, \"text\": \"The conformance fixture reserves exit code 2 for refusing a ",
+    "directory that holds no config.json.\", \"state\": \"done\"}\n"
+);
+
+/// The project config: the citation store and nothing else, because the rest of that file
+/// belongs to a run the suite does not drive.
+fn config() -> String {
+    format!(
+        r#"{{
+  "citationStores": [
+    {{ "name": "{CITATION_STORE}", "kind": "file", "path": "{CITATION_PATH}" }}
+  ]
+}}
+"#
+    )
+}
+
 const CARGO_TOML: &str = r#"[package]
 name = "veridoc-conformance-fixture"
 version = "0.1.0"
@@ -60,10 +89,13 @@ pub mod probe;
 pub use probe::{probe, Config};
 "#;
 
+/// The fixture's source. `probe` is the `pub` item, so it is the one entry `surface` reports for
+/// this file and the one declaration `derivable` reads facts out of; `config_of` is private, so
+/// the same two answers must leave it out.
 const PROBE_RS: &str = r#"//! The fixture's subject. `probe` refuses a directory that holds no `config.json`, and the
 //! refusal names the directory, so a leaf over `message` has something to compare.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The configuration `probe` reads from one directory.
 pub struct Config {
@@ -72,13 +104,18 @@ pub struct Config {
 
 /// Refuses a directory that holds no `config.json`.
 pub fn probe(dir: &Path) -> Result<Config, String> {
-    let path = dir.join("config.json");
+    let path = config_of(dir);
     if !path.is_file() {
         return Err(format!("{} holds no config.json", dir.display()));
     }
     Ok(Config {
         root: dir.display().to_string(),
     })
+}
+
+/// Where a directory's configuration would sit. Private, so the crate does not promise it.
+fn config_of(dir: &Path) -> PathBuf {
+    dir.join("config.json")
 }
 "#;
 
@@ -288,9 +325,9 @@ fn claims(artefact_hash: &str) -> String {
     )
 }
 
-/// `veridoc-conformance.json`: the names the suite drives. `citationStore` and `citationId` are
-/// required by the manifest's shape and are unread here, because this build declares no `citation`
-/// capability and the suite gates `cite-schema` off before calling it.
+/// `veridoc-conformance.json`: the names the suite drives. The citation pair names the store and
+/// the log this project renders beside it, so `cite-schema` reads an answer out of a file the
+/// emitter wrote rather than a name with nothing behind it.
 fn conformance_manifest() -> String {
     format!(
         r#"{{
@@ -299,8 +336,9 @@ fn conformance_manifest() -> String {
   "fixture": "{FIXTURE}",
   "action": "{ACTION}",
   "observables": ["exit_code", "message"],
-  "citationStore": "session",
-  "citationId": "probe-refusal",
+  "citationStore": "{CITATION_STORE}",
+  "citationId": "{CITATION_ID}",
+  "citationTurn": {CITATION_TURN},
   "bivalence": [
     {{ "predicate": "no-assertion-tree", "bivalent": false }},
     {{ "predicate": "empty-conjunction", "bivalent": false }},
@@ -344,6 +382,12 @@ pub fn render(dir: &Path) -> Result<PathBuf, String> {
     write(dir, "src/probe.claims.json", &claims(&hash))?;
     write(dir, "veridoc.tree.json", &tree())?;
     write(dir, "veridoc-conformance.json", &conformance_manifest())?;
+    write(dir, ".veridoc/config.json", &config())?;
+    write(
+        dir,
+        &format!("{CITATION_PATH}/{CITATION_ID}.jsonl"),
+        CITATION_LOG,
+    )?;
     write(dir, "docs/architecture.spec.md", SPEC_MD)?;
     fs::create_dir_all(dir.join(FIXTURE))
         .map_err(|e| format!("the fixture directory could not be created: {e}"))?;
@@ -503,6 +547,86 @@ mod tests {
                 return Err(format!(
                     "{path} does not hash to the {want} the claim records"
                 ));
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(&dir);
+        outcome.unwrap();
+    }
+
+    /// The three methods this build answers out of the rendered tree, not out of a name the
+    /// manifest carries: `cite` reads the log the declared store's directory holds, and `surface`
+    /// and `derivable` read the source that declares one `pub` item and one private one. A fixture
+    /// that stopped rendering either would reach the suite as a red rule in a project nobody
+    /// edited, which is what this check is for.
+    #[test]
+    fn the_rendered_project_answers_cite_derivable_and_surface() {
+        let dir =
+            std::env::temp_dir().join(format!("veridoc-emitter-methods-{}", std::process::id()));
+        let outcome = (|| -> Result<(), String> {
+            render(&dir)?;
+            let manifest = json_at(&dir, "veridoc-conformance.json")?;
+            let config = json_at(&dir, ".veridoc/config.json")?;
+            let store = manifest["citationStore"]
+                .as_str()
+                .ok_or("the manifest names no citation store")?;
+            let id = manifest["citationId"]
+                .as_str()
+                .ok_or("the manifest names no citation id")?;
+            let turn = manifest["citationTurn"].as_u64().unwrap_or(1) as usize;
+            let declared = config["citationStores"]
+                .as_array()
+                .ok_or("the rendered config declares no citationStores")?
+                .iter()
+                .find(|entry| entry["name"].as_str() == Some(store))
+                .ok_or_else(|| {
+                    format!("the config declares no store {store:?}, so cite answers no store named {store}")
+                })?;
+            if declared["kind"].as_str() != Some("file") {
+                return Err(format!(
+                    "store {store:?} is kind {:?}, which this plugin cannot read",
+                    declared["kind"].as_str()
+                ));
+            }
+            let path = declared["path"]
+                .as_str()
+                .ok_or_else(|| format!("store {store:?} declares no path for its logs"))?;
+            let log = dir.join(path).join(format!("{id}.jsonl"));
+            let text = fs::read_to_string(&log)
+                .map_err(|e| format!("{} is unreadable: {e}", log.display()))?;
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            let entry = lines.get(turn - 1).ok_or_else(|| {
+                format!(
+                    "turn {turn} is not in {path}, which has {} turns",
+                    lines.len()
+                )
+            })?;
+            let cited: serde_json::Value =
+                serde_json::from_str(entry).map_err(|e| format!("turn {turn} is not json: {e}"))?;
+            if cited["text"].as_str().unwrap_or_default().trim().is_empty() {
+                return Err(format!(
+                    "turn {turn} of {path}/{id}.jsonl states no text, and the suite fails a \
+                     resolved citation with an empty one"
+                ));
+            }
+
+            let source = fs::read_to_string(dir.join("src/probe.rs"))
+                .map_err(|e| format!("src/probe.rs is unreadable: {e}"))?;
+            if !source.contains("pub fn probe(dir: &Path) -> Result<Config, String> {") {
+                return Err(
+                    "the subject every claim names is no longer a pub fn with a declared return \
+                     type, so derivable answers it without a parameter or return fact"
+                        .to_string(),
+                );
+            }
+            if !source.contains("\nfn config_of(") {
+                return Err(
+                    "the fixture declares no private item, so surface has nothing to leave out"
+                        .to_string(),
+                );
             }
             Ok(())
         })();

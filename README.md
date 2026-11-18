@@ -17,9 +17,9 @@ source, and the scenario harness is a binary that you write and veridoc runs.
 
 | File | What it holds |
 | --- | --- |
-| `.veridoc/config.json` | The plugin command, the coverage floor, the scenario deadline, and the judge |
-| `veridoc.tree.json` | The concepts, the document tree, the observables, the actions, the fixtures, and the harness name |
-| `src/<module>.claims.json` | The claims about that module, one sidecar per module |
+| `.veridoc/config.json` | The plugin command, the coverage floor, the scenario deadline, and the judge model |
+| `veridoc.tree.json` | The concepts, the document tree, the source roots, the observables, the actions, the fixtures, and the harness name |
+| `<sourceRoot>/<module>.claims.json` | The claims about that module, one sidecar per module. `sourceRoots` in the tree names the roots a project scans; `src` is the default, and a Cargo workspace whose veridoc project is the repository root names each crate, as in `crates/my-crate/src` |
 | `docs/*.spec.md` | The prose, in `<doc-section>` sections that name claims with `<doc-claim>` |
 | `features/*.feature` | The scenarios: a `@id:` tag, a `Given` that names a fixture, a `When` that names an action |
 | `src/bin/<harness>.rs` | The scenario harness, about twenty lines |
@@ -125,23 +125,55 @@ the harness has no such predicate.
 
 ## Capabilities
 
-The handshake reports four capabilities. A method whose capability is absent is answered `-32601`,
-because the profile fixes what an absent capability costs and an invented answer is not in that list.
+The handshake reports eight capabilities, one for every method of the profile, and every one of
+them is answered by this build. A method whose capability is absent is answered `-32601`, because
+the profile fixes what an absent capability costs and an invented answer is not in that list.
 
 | Capability | Status | What the absence costs you |
 | --- | --- | --- |
+| `initialization` | implemented | without it `veridoc init` writes only `.veridoc/config.json` and tells you to create `veridoc.tree.json` yourself |
 | `collect` | implemented | without it there is no build at all |
 | `resolution` | implemented | without it the plugin cannot be used |
+| `derivability` | implemented | the redundancy ban is skipped, so a claim a declaration already states is kept |
 | `bivalence` | implemented | every checkable claim becomes an error rather than a pass |
 | `execution` | implemented | scenarios are bound but never run |
-| `derivability` | not yet | the redundancy ban is skipped, so a claim a declaration already states is kept |
-| `surface` | not yet | the report says uncovered symbols are unknown |
-| `cite` | not yet | a citation-channel claim cannot be answered |
+| `citation` | implemented | a citation-channel claim cannot be answered |
+| `surface` | implemented | the report says uncovered symbols are unknown |
 
 `bivalence` answers structurally. A tree of `equals` and `contains` checks is bivalent, because one
 side comes from a run and the other from you. A tree with no leaf is not, because nothing in it can
 fail. A tree with a `satisfies` leaf is answered `false` with the reason, because deciding that leaf
 would mean settling a Rust predicate's two outcomes without running them.
+
+### What `derivable`, `surface`, and `cite` answer
+
+`derivable` reports the facts a reader can already see in one declaration, and only those: the
+visibility the header carries (`pub`, `pub(crate)`, or private), the parameter list and the declared
+return type as the header spells them, the variants an enum accepts, and each `panic!` or
+`unreachable!` the body states, with the line it sits on, plus the first `?` that hands a failure up
+when the header declares a `Result` or an `Option` to hand it to. Nothing the compiler would infer
+is reported, so a claim about a type you never wrote is never rejected for restating it. A referent
+id the project declares nothing behind answers no facts, and a concept id answers the line that
+declares it in `veridoc.tree.json`.
+
+`surface` lists every item whose header says `pub`, with the same referent id `resolve` reports for
+it, so the run can tell you which public symbol no claim covers. `pub(crate)`, `pub(super)`,
+`pub(in path)`, and private items are not on the surface: the header says who may reach them, and it
+does not say a caller outside the crate.
+
+`cite` reads the two store kinds of the profile out of `citationStores` in `.veridoc/config.json`,
+the file the host names in `VERIDOC_CONFIG`:
+
+```json
+{ "citationStores": [{ "name": "session", "kind": "file", "path": ".veridoc/citations" }] }
+```
+
+A `file` store is a directory of `<id>.jsonl` logs read against your project root, and turn `n` of
+the log is its `n`th line: `{ "turn": 1, "text": "…", "state": "done" }`. A `git` store reads the
+repository your project lives in: the answer is the commit message, and its `state` is `merged` or
+`dangling`. A store you never declared, a log that is not there, and a kind this plugin cannot read
+are each reported with the reason naming what was looked for, and the run reports that finding
+rather than passing the claim.
 
 ## Running it
 
@@ -165,14 +197,24 @@ cargo run --manifest-path ../pluginrpc/Cargo.toml --bin prpc-core -- \
   ../veridoc/veridoc-1.profile.json veridoc-plugin.json
 ```
 
+The whole profile is driven against this checkout by the host's own conformance suite, whose
+fixture project is rendered by `crates/plugin-rust/src/bin/veridoc-conformance-emitter.rs`:
+
+```sh
+veridoc validate-plugin .
+```
+
 ## Layout
 
 | Path | What it is |
 | --- | --- |
 | `crates/plugin-rust/src/main.rs` | The `prpc/1` server: the method vocabulary, the handshake, the refusals |
 | `crates/plugin-rust/src/project.rs` | The vocabulary file, the claim sidecars, and the `collect` answer |
-| `crates/plugin-rust/src/decl.rs` | The declaration scan that answers `resolve` |
+| `crates/plugin-rust/src/decl.rs` | The declaration scan: headers, visibility, bodies, and the parameter lists `resolve` and `derivable` read |
 | `crates/plugin-rust/src/resolve.rs` | Reference keys, referent ids, and signatures |
+| `crates/plugin-rust/src/derivable.rs` | The facts a declaration states, and the referent id that finds it |
+| `crates/plugin-rust/src/cite.rs` | The `file` and `git` citation stores, and the reasons a citation goes unanswered |
+| `crates/plugin-rust/src/surface.rs` | The `pub` items, with the ids `resolve` reports |
 | `crates/plugin-rust/src/run.rs` | The harness build, the scenario spawn, the deadline, and the failure kinds |
 | `crates/plugin-rust/src/bivalence.rs` | The structural bivalence rule |
 | `examples/rust-scanner/` | An adopting project, used as the end-to-end fixture |

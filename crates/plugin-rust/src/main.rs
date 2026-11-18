@@ -6,11 +6,15 @@
 //! owns is the method vocabulary, the claim format in Rust source, and the answers.
 
 mod bivalence;
+mod cite;
 mod decl;
+mod derivable;
 mod ids;
+mod init;
 mod project;
 mod resolve;
 mod run;
+mod surface;
 
 use std::io::{self, Write};
 
@@ -26,15 +30,26 @@ use plugin_rpc::{
 const PROTOCOL_VERSION: &str = "veridoc/1";
 
 /// The capabilities this build answers. Every name here is in `veridoc-1.profile.json`'s
-/// vocabulary, and a method whose capability is absent is answered `-32601` rather than with an
+/// vocabulary, and a method whose capability is absent is answered `-32601` rather than with a
 /// result, because the profile defines what an absent capability costs and a made-up answer does
-/// not appear in that list.
-const CAPABILITIES: &[&str] = &["collect", "resolution", "bivalence", "execution"];
+/// not appear in that list. The eight are the whole profile: every method `Method` names has an
+/// arm in `dispatch`, so no capability is published for an answer the plugin does not give.
+const CAPABILITIES: &[&str] = &[
+    "initialization",
+    "collect",
+    "resolution",
+    "derivability",
+    "bivalence",
+    "execution",
+    "citation",
+    "surface",
+];
 
 /// The `veridoc/1` method vocabulary. The mechanism transports these strings and gives them no
 /// meaning; `from_wire` is what turns a name outside the profile into a `-32601` (§9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Method {
+    Init,
     Collect,
     Resolve,
     Derivable,
@@ -47,6 +62,7 @@ enum Method {
 impl MethodName for Method {
     fn name(&self) -> &'static str {
         match self {
+            Method::Init => "init",
             Method::Collect => "collect",
             Method::Resolve => "resolve",
             Method::Derivable => "derivable",
@@ -59,6 +75,7 @@ impl MethodName for Method {
 
     fn from_wire(name: &str) -> Option<Self> {
         match name {
+            "init" => Some(Method::Init),
             "collect" => Some(Method::Collect),
             "resolve" => Some(Method::Resolve),
             "derivable" => Some(Method::Derivable),
@@ -122,6 +139,13 @@ fn dispatch(line: &str, root: &mut Option<PathBuf>) -> Response {
         return Response::result(request.id, handshake());
     }
     match Method::from_wire(&request.method) {
+        Some(Method::Init) => {
+            let params = request.params.unwrap_or(serde_json::Value::Null);
+            match init::init(&params) {
+                Ok(result) => Response::result(request.id, result),
+                Err((code, reason)) => Response::refusal(request.id, code, reason),
+            }
+        }
         None => Response::refusal(
             request.id,
             METHOD_NOT_FOUND,
@@ -188,16 +212,46 @@ fn dispatch(line: &str, root: &mut Option<PathBuf>) -> Response {
                 Err(reason) => Response::refusal(request.id, PLUGIN_ERROR, reason),
             }
         }
-        Some(method) => Response::refusal(
-            request.id,
-            METHOD_NOT_FOUND,
-            format!(
-                "veridoc-plugin-rust {} declares {:?} and answers no {}",
-                env!("CARGO_PKG_VERSION"),
-                CAPABILITIES,
-                method.name(),
-            ),
-        ),
+        Some(Method::Derivable) => {
+            let Some(project_root) = root.clone() else {
+                return Response::refusal(
+                    request.id,
+                    PLUGIN_ERROR,
+                    "collect has not run, so there is no project whose declarations to read",
+                );
+            };
+            match param_string(&request, "referentId", "referentId is required") {
+                Ok(referent) => {
+                    Response::result(request.id, derivable::facts(&project_root, &referent))
+                }
+                Err(reason) => Response::refusal(request.id, INVALID_REQUEST, reason),
+            }
+        }
+        Some(Method::Cite) => {
+            let Some(project_root) = root.clone() else {
+                return Response::refusal(
+                    request.id,
+                    PLUGIN_ERROR,
+                    "collect has not run, so there is no project whose citation stores to read",
+                );
+            };
+            match param_citations(&request) {
+                Ok(citations) => {
+                    Response::result(request.id, cite::cite(&project_root, &citations))
+                }
+                Err(reason) => Response::refusal(request.id, INVALID_REQUEST, reason),
+            }
+        }
+        Some(Method::Surface) => {
+            let Some(project_root) = root.clone() else {
+                return Response::refusal(
+                    request.id,
+                    PLUGIN_ERROR,
+                    "collect has not run, so there is no source tree to list the surface of",
+                );
+            };
+            Response::result(request.id, surface::surface(&project_root))
+        }
     }
 }
 
@@ -224,6 +278,23 @@ fn param_string(request: &Request, key: &str, missing: &str) -> Result<String, S
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| missing.to_string())
+}
+
+/// The `cite` parameters. Each entry is read as the profile's `Citation`, so a store, an id, or
+/// a turn of the wrong shape is an invalid request naming the field rather than a citation the
+/// plugin answers as unresolved.
+fn param_citations(request: &Request) -> Result<Vec<cite::Citation>, String> {
+    const MISSING: &str = "citations must be an array of {store, id, turn} objects";
+    let citations = request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("citations"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| MISSING.to_string())?;
+    citations
+        .iter()
+        .map(|value| serde_json::from_value(value.clone()).map_err(|e| format!("{MISSING}; {e}")))
+        .collect()
 }
 
 /// The `run` parameters. A missing or mistyped field is an invalid request rather than a run

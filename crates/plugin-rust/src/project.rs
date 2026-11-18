@@ -2,10 +2,10 @@
 //!
 //! Two kinds of file are read:
 //!
-//! - `<root>/veridoc.tree.json` — the concepts, the document tree, and the observable, action,
-//!   and fixture vocabulary.
-//! - `<root>/src/**/<module>.claims.json` — the claims, one file per module: the claims about
-//!   `src/config.rs` live in `src/config.claims.json`.
+//! - `<root>/veridoc.tree.json` — the concepts, the document tree, the source roots, and the
+//!   observable, action, and fixture vocabulary.
+//! - `<root>/<sourceRoot>/**/<module>.claims.json` — the claims, one file per module: the claims
+//!   about `src/config.rs` live in `src/config.claims.json`.
 //!
 //! An author writes the symbol a claim is about and the predicate; the plugin supplies the
 //! referent token, the file, and the line. That is what makes a rename hurt: the claim keeps
@@ -13,13 +13,15 @@
 //! claim rather than reading the claim as still describing whatever now occupies the file.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::ids;
 use serde::{Deserialize, Serialize};
 
 /// The vocabulary and document-tree file, read from the project root.
 pub const TREE_FILE: &str = "veridoc.tree.json";
+/// The directory the sidecar walk covers when the tree declares no `sourceRoots`.
+pub const DEFAULT_SOURCE_ROOT: &str = "src";
 /// The suffix a claim sidecar carries, beside the source file it describes.
 pub const SIDECAR_SUFFIX: &str = ".claims.json";
 
@@ -167,6 +169,21 @@ pub struct Tree {
     /// every claim, but a scenario-channel claim cannot be run, and the run failure says so.
     #[serde(default)]
     pub harness: Option<String>,
+    /// The directories that hold the claim sidecars, relative to the project root. A project whose
+    /// root is a Cargo workspace names each crate's source directory, because the workspace root
+    /// has no `src` of its own. Empty means `src`.
+    #[serde(default)]
+    pub source_roots: Vec<String>,
+}
+
+impl Tree {
+    /// The directories the sidecar walk covers, or `src` when the tree names none.
+    pub fn source_roots(&self) -> Vec<&str> {
+        if self.source_roots.is_empty() {
+            return vec![DEFAULT_SOURCE_ROOT];
+        }
+        self.source_roots.iter().map(String::as_str).collect()
+    }
 }
 
 /// One sidecar file.
@@ -270,8 +287,15 @@ pub fn load(root: &Path) -> Result<Project, String> {
 
 fn gather(root: &Path) -> Result<(Tree, Vec<RawClaim>, Vec<Skipped>), String> {
     let (tree, mut skipped) = read_tree(root);
+    let roots = tree.source_roots();
+    if let Some(escaping) = roots.iter().find(|root| escapes(root)) {
+        return Err(format!(
+            "{TREE_FILE} sourceRoots entry {escaping:?} is absolute or climbs out of the project, \
+             so a sidecar under it would have no project-relative path"
+        ));
+    }
     let mut claims = Vec::new();
-    for sidecar in sidecars(root)? {
+    for sidecar in sidecars(root, &roots)? {
         let relative = relative(root, &sidecar);
         let text = fs::read_to_string(&sidecar)
             .map_err(|e| format!("{relative} could not be read: {e}"))?;
@@ -314,11 +338,12 @@ fn gather(root: &Path) -> Result<(Tree, Vec<RawClaim>, Vec<Skipped>), String> {
             });
         }
     }
-    if !sidecars_exist(root)? && claims.is_empty() {
+    if !sidecars_exist(root, &roots)? && claims.is_empty() {
         skipped.push(Skipped {
-            file: "src".to_string(),
+            file: roots.join("/"),
             reason: format!(
-                "no *{SIDECAR_SUFFIX} file under src/, so the project declares no claim"
+                "no *{SIDECAR_SUFFIX} file under {}, so the project declares no claim",
+                roots.join("/")
             ),
         });
     }
@@ -349,20 +374,50 @@ fn read_tree(root: &Path) -> (Tree, Vec<Skipped>) {
     }
 }
 
-/// Every sidecar under `<root>/src`, in path order, so the claim order a project sees does not
-/// depend on the directory listing.
-fn sidecars(root: &Path) -> Result<Vec<PathBuf>, String> {
+/// Every sidecar under the declared source roots, in path order, so the claim order a project
+/// sees does not depend on the directory listing.
+fn sidecars(root: &Path, roots: &[&str]) -> Result<Vec<PathBuf>, String> {
     let mut found = Vec::new();
-    walk(&root.join("src"), &mut found)?;
+    for name in roots {
+        walk(&root.join(name), SIDECAR_SUFFIX, &mut found)?;
+    }
     found.sort();
     Ok(found)
 }
 
-fn sidecars_exist(root: &Path) -> Result<bool, String> {
-    Ok(!sidecars(root)?.is_empty())
+/// Every Rust source file under the declared source roots, in path order. `derivable` and
+/// `surface` read these, and a referent identity is hashed from the project-relative path they
+/// carry, so the two methods can only report what `resolve` can settle. A root that climbs out
+/// of the project is skipped rather than scanned: `collect` has already refused the project for
+/// declaring one, and a file under it has no project-relative path to hash.
+pub fn sources(root: &Path) -> Vec<PathBuf> {
+    let (tree, _) = read_tree(root);
+    let mut found = Vec::new();
+    for name in tree.source_roots() {
+        if escapes(name) {
+            continue;
+        }
+        let _ = walk(&root.join(name), ".rs", &mut found);
+    }
+    found.sort();
+    found
 }
 
-fn walk(dir: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
+fn sidecars_exist(root: &Path, roots: &[&str]) -> Result<bool, String> {
+    Ok(!sidecars(root, roots)?.is_empty())
+}
+
+/// A source root that is absolute or climbs out of the project. `relative` cannot make a path
+/// under such a root project-relative, and the referent identity is hashed from that path.
+fn escapes(name: &str) -> bool {
+    let path = Path::new(name);
+    path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn walk(dir: &Path, suffix: &str, found: &mut Vec<PathBuf>) -> Result<(), String> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Ok(());
     };
@@ -370,11 +425,11 @@ fn walk(dir: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
     children.sort();
     for child in children {
         if child.is_dir() {
-            walk(&child, found)?;
+            walk(&child, suffix, found)?;
         } else if child
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with(SIDECAR_SUFFIX))
+            .is_some_and(|n| n.ends_with(suffix))
         {
             found.push(child);
         }
@@ -435,9 +490,9 @@ pub fn concepts(root: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Channel, Project, RawClaim, Subject};
+    use super::{collect, Channel, Project, RawClaim, Subject};
     use crate::ids;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// One collected claim about `parse_config`, with only the predicate the author wrote varying.
     fn claim(predicate: &str) -> RawClaim {
@@ -514,5 +569,69 @@ mod tests {
             "a name nothing shares keeps its bare spelling"
         );
         assert!(!named_third.contains('~'), "{named_third}");
+    }
+
+    /// A scratch project directory, unique to this process and this tag.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("veridoc-project-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    fn write(root: &Path, relative: &str, text: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("the directory");
+        std::fs::write(path, text).expect("the file");
+    }
+
+    const SIDECAR: &str = r#"{"claims":[{"kind":"requires","symbol":"parse_config",
+        "concept":"configuration","predicate":"rejects a missing root",
+        "text":"The parser refuses a missing project root.",
+        "channel":{"scenario":"run-scanner"}}]}"#;
+
+    /// A project whose root is a Cargo workspace: the sidecars live under a declared source root
+    /// rather than under `src`, and the paths they report stay project-relative.
+    #[test]
+    fn a_declared_source_root_is_where_the_sidecars_are_found() {
+        let root = scratch("roots");
+        write(
+            &root,
+            "veridoc.tree.json",
+            r#"{"concepts":["configuration"],"sourceRoots":["crates/a/src"]}"#,
+        );
+        write(&root, "crates/a/src/config.claims.json", SIDECAR);
+        write(&root, "crates/a/src/config.rs", "fn parse_config() {}\n");
+        let collected = collect(&root).expect("the project collects");
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(
+            collected.claims.len(),
+            1,
+            "the declared root was not scanned"
+        );
+        assert_eq!(collected.claims[0].file, "crates/a/src/config.claims.json");
+        assert_eq!(
+            collected.claims[0].subject,
+            Subject::Symbol {
+                name: "parse_config".to_string(),
+                from: "crates/a/src/config.rs".to_string(),
+            }
+        );
+    }
+
+    /// A root that climbs out of the project is refused, not scanned: the referent identity is
+    /// hashed from the project-relative path, and a sidecar outside the root has none.
+    #[test]
+    fn a_source_root_that_climbs_out_of_the_project_is_refused() {
+        let root = scratch("escape");
+        write(
+            &root,
+            "veridoc.tree.json",
+            r#"{"sourceRoots":["../outside"]}"#,
+        );
+        write(&root, "src/config.claims.json", SIDECAR);
+        let error = collect(&root).expect_err("an escaping root is refused");
+        std::fs::remove_dir_all(&root).ok();
+        assert!(error.contains("../outside"), "{error}");
     }
 }
