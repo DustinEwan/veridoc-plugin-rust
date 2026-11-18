@@ -1,7 +1,7 @@
 //! `resolve`: settling the reference keys `collect` reported.
 //!
 //! A reference key is `<file>|<name>` for a symbol and `concept|<name>` for a concept, which is
-//! `RefToken::key` in the engine (`crates/veridoc-protocol/src/contract.rs:79-84`). An answer
+//! `RefToken::key` in the engine (`crates/veridoc-protocol/src/contract.rs`). An answer
 //! that cannot settle one is a normal answer carrying a reason, not a protocol error, because the
 //! engine turns the reason into the diagnostic the author reads.
 
@@ -46,8 +46,7 @@ pub fn resolve(root: &Path, refs: &[String], concepts: &[String]) -> ResolveResu
             } else {
                 unresolved.push(UnresolvedRef {
                     r#ref: reference.clone(),
-                    reason: "the reference is neither <file>|<name> nor concept|<name>"
-                        .to_string(),
+                    reason: "the reference is neither <file>|<name> nor concept|<name>".to_string(),
                 });
             }
             continue;

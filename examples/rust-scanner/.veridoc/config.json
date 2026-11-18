@@ -1,5 +1,5 @@
 {
-  "protocol": "vd/1",
+  "protocol": "veridoc/1",
   "plugin": {
     "command": [
       "../../target/release/veridoc-plugin-rust"

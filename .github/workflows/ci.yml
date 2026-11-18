@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The dependency points one way: this job obtains the veridoc executable and nothing else.
+  # Conformance is a property of this plugin, so the suite is driven here; the engine
+  # repository's CI carries only its own fake plugin.
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # Formatting is a gate, not a courtesy: `decl.rs` and `resolve.rs` carried rustfmt
+      # deviations at HEAD because nothing here asked.
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  # The example names this repository's release binary directly, and its judge is a script
+  # the repository ships so that no model call happens in CI. A green check is the
+  # end-to-end gate: collect, resolve, bind, bivalence, run, and the report.
+  example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Build the plugin the example points at
+        run: cargo build --release
+
+      - name: Install the veridoc executable
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://raw.githubusercontent.com/${{ github.repository_owner }}/veridoc/main/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # The checkout is everything the command receives: it reads veridoc-plugin.json, runs
+      # the build steps, and drives the conformance suite against the built binary.
+      - name: Validate this plugin's checkout
+        run: veridoc validate-plugin
+
+      - name: The example runs green
+        run: veridoc check --project examples/rust-scanner

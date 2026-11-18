@@ -20,7 +20,7 @@
 //! non-zero but has already printed its answer is still believed, because a refusal inside the
 //! project's code is an observed value the assertion decides, not a run failure (`run.ts:2`).
 //! Only a harness that answers nothing is a failure, and the kind separates the four causes the
-//! profile names (`docs/schema/vd-1/run-failure-kind.json`).
+//! profile names (`docs/schema/veridoc-1/run-failure-kind.json`).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -87,7 +87,8 @@ fn execute(project: &Project, request: &Request) -> Result<Value, (&'static str,
                 "plugin",
                 format!(
                     "no action named {:?} is declared in {}",
-                    request.action, project::TREE_FILE
+                    request.action,
+                    project::TREE_FILE
                 ),
             )
         })?;
@@ -96,7 +97,8 @@ fn execute(project: &Project, request: &Request) -> Result<Value, (&'static str,
             "fixture",
             format!(
                 "no fixture named {:?} is declared in {}",
-                request.fixture, project::TREE_FILE
+                request.fixture,
+                project::TREE_FILE
             ),
         ));
     }
@@ -150,7 +152,7 @@ fn execute(project: &Project, request: &Request) -> Result<Value, (&'static str,
         let owner = project
             .scenario(&request.scenario_id)
             .into_iter()
-            .find(|claim| project::claim_id(claim) == claim_part)
+            .find(|claim| project.claim_name(claim) == claim_part)
             .ok_or_else(|| {
                 (
                     "plugin",
@@ -174,12 +176,16 @@ fn execute(project: &Project, request: &Request) -> Result<Value, (&'static str,
             ));
         };
         // The engine decides `equals` and `contains` itself from the observed values
-        // (`execute.rs:198-210`); only a `satisfies` leaf needs the plugin's answer.
+        // (`evaluate` in `crates/veridoc-engine/src/execute.rs`); only a `satisfies` leaf needs the
+        // plugin's answer.
         let Some(spec) = check.get("satisfies") else {
             satisfied.push(json!({ "leafId": leaf_id, "ok": true }));
             continue;
         };
-        let source = spec.get("source").and_then(Value::as_str).unwrap_or_default();
+        let source = spec
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         match answers.satisfied.get(source) {
             Some(ok) => satisfied.push(json!({ "leafId": leaf_id, "ok": *ok })),
             None => {
@@ -234,7 +240,11 @@ fn harness_binary(root: &Path, harness: &str) -> Result<PathBuf, (&'static str, 
 /// Run the harness under the scenario's deadline. The deadline covers the scenario, not the build:
 /// a cold build of a real crate is longer than any scenario deadline, which is why the build is
 /// done once and outside it.
-fn spawn(binary: &Path, request: &Request, fixture: &Path) -> Result<Answers, (&'static str, String)> {
+fn spawn(
+    binary: &Path,
+    request: &Request,
+    fixture: &Path,
+) -> Result<Answers, (&'static str, String)> {
     let mut child = Command::new(binary)
         .arg(fixture)
         .stdin(Stdio::piped())
@@ -254,19 +264,24 @@ fn spawn(binary: &Path, request: &Request, fixture: &Path) -> Result<Answers, (&
         "fixture": fixture,
         "deadlineMs": request.deadline_ms,
     });
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or(("plugin", "the harness has no stdin to write the request to".to_string()))?;
+    let mut stdin = child.stdin.take().ok_or((
+        "plugin",
+        "the harness has no stdin to write the request to".to_string(),
+    ))?;
     stdin
         .write_all(payload.to_string().as_bytes())
-        .map_err(|e| ("plugin", format!("the harness request could not be written: {e}")))?;
+        .map_err(|e| {
+            (
+                "plugin",
+                format!("the harness request could not be written: {e}"),
+            )
+        })?;
     drop(stdin);
 
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or(("plugin", "the harness has no stdout to read the answer from".to_string()))?;
+    let mut stdout = child.stdout.take().ok_or((
+        "plugin",
+        "the harness has no stdout to read the answer from".to_string(),
+    ))?;
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -322,7 +337,10 @@ fn spawn(binary: &Path, request: &Request, fixture: &Path) -> Result<Answers, (&
         return Err((
             "plugin",
             if status.success() {
-                format!("the harness {harness} answered no JSON line", harness = harness_name(binary))
+                format!(
+                    "the harness {harness} answered no JSON line",
+                    harness = harness_name(binary)
+                )
             } else {
                 format!(
                     "the harness {harness} exited {status} without answering: {stderr}",
@@ -365,7 +383,8 @@ fn spawn(binary: &Path, request: &Request, fixture: &Path) -> Result<Answers, (&
 }
 
 /// The assertion tree's leaves in preorder, each as its `is` object, which is the order the engine
-/// numbers them in (`execute.rs:191-222`, and `run.ts:26-33` for the same walk).
+/// numbers them in (`evaluate` in `crates/veridoc-engine/src/execute.rs`, and `run.ts:26-33` for the
+/// same walk).
 pub fn leaves(tree: &Value) -> Vec<&Value> {
     let mut found = Vec::new();
     walk(tree, &mut found);
@@ -394,8 +413,9 @@ fn walk<'a>(node: &'a Value, found: &mut Vec<&'a Value>) {
     }
 }
 
-/// `<claim id>#l<n>` into its two parts. A leaf id with no marker is treated as leaf 0 of the
-/// whole id, which is what the engine sends when a claim has one leaf.
+/// `<claim name>#l<n>` into its two parts, split at the last `#l` because a claim name carries a
+/// `#` of its own. A leaf id with no marker is treated as leaf 0 of the whole id, which is what the
+/// engine sends when a claim has one leaf.
 fn split_leaf(leaf_id: &str) -> (&str, usize) {
     match leaf_id.rsplit_once("#l") {
         Some((claim, index)) => (claim, index.parse().unwrap_or(0)),
@@ -436,7 +456,8 @@ mod tests {
     #[test]
     fn leaves_are_numbered_in_preorder() {
         // The engine numbers leaves by walking `all`, then `any`, then `not`, then the leaf
-        // itself (`execute.rs:191-222`). A different order answers the wrong leaf.
+        // itself (`evaluate` in `crates/veridoc-engine/src/execute.rs`). A different order answers
+        // the wrong leaf.
         let tree = json!({ "all": [
             { "obs": "exit_code", "is": { "equals": 2 } },
             { "any": [
@@ -452,7 +473,13 @@ mod tests {
 
     #[test]
     fn a_leaf_id_splits_into_its_claim_and_its_index() {
-        assert_eq!(split_leaf("c0123456789abc#l2"), ("c0123456789abc", 2));
-        assert_eq!(split_leaf("c0123456789abc"), ("c0123456789abc", 0));
+        assert_eq!(
+            split_leaf("probe#rejects-missing-project-root#l2"),
+            ("probe#rejects-missing-project-root", 2)
+        );
+        assert_eq!(
+            split_leaf("probe#rejects-missing-project-root"),
+            ("probe#rejects-missing-project-root", 0)
+        );
     }
 }

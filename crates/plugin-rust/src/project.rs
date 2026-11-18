@@ -15,8 +15,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
 use crate::ids;
+use serde::{Deserialize, Serialize};
 
 /// The vocabulary and document-tree file, read from the project root.
 pub const TREE_FILE: &str = "veridoc.tree.json";
@@ -47,7 +47,6 @@ pub struct RawClaim {
     pub predicate: String,
     pub text: String,
     pub channel: Channel,
-    pub supports: Vec<String>,
     pub file: String,
     pub line: usize,
 }
@@ -64,12 +63,14 @@ pub enum Subject {
 }
 
 impl Subject {
-    /// The referent identity the engine stores for this subject: the symbol's file and name, or
-    /// the concept's name. A claim's id is hashed from this and its predicate.
-    pub fn referent_id(&self) -> String {
+    /// The author's name for the thing the claim is about: the symbol's name for a symbol subject,
+    /// the concept's name for a concept subject. It is the left half of the claim's readable name
+    /// and of the identity hash, and it comes from the author rather than from the path the code
+    /// sits in (`RefToken::subject_name` in `crates/veridoc-protocol/src/contract.rs`). The
+    /// path-derived referent id is what `resolve` reports, and nothing here derives from it.
+    pub fn subject_name(&self) -> &str {
         match self {
-            Subject::Symbol { name, from } => ids::referent_id(from, name),
-            Subject::Concept { name } => ids::concept_id(name),
+            Subject::Symbol { name, .. } | Subject::Concept { name } => name,
         }
     }
 }
@@ -108,9 +109,9 @@ pub struct Citation {
 
 impl Channel {
     /// How many of the three channels are populated. `scenario` and `asserts` are one channel --
-    /// the assertion tree is the scenario's evidence, not a second channel (`contract.rs:104-113`)
-    /// -- so a claim that names a scenario and its assertion tree counts once, and one that adds an
-    /// artefact counts twice and is refused.
+    /// the assertion tree is the scenario's evidence, not a second channel (`Channel::populated` in
+    /// `crates/veridoc-protocol/src/contract.rs`) -- so a claim that names a scenario and its
+    /// assertion tree counts once, and one that adds an artefact counts twice and is refused.
     fn set(&self) -> usize {
         usize::from(self.scenario.is_some() || self.asserts.is_some())
             + usize::from(self.artefact.is_some())
@@ -125,24 +126,8 @@ pub struct DocumentDecl {
     pub path: String,
     pub audience: String,
     pub question: String,
-    pub selects: Selects,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_applicable: Option<String>,
-}
-
-/// A document node's selection. An all-absent selection selects nothing, which the engine
-/// reports; the plugin passes it through rather than guessing.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
-pub struct Selects {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concept: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kind: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub referent: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub claims: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,8 +192,6 @@ pub struct AuthorClaim {
     pub predicate: String,
     pub text: String,
     pub channel: Channel,
-    #[serde(default)]
-    pub supports: Vec<String>,
 }
 
 const KINDS: [&str; 5] = ["requires", "ensures", "invariant", "witness", "because"];
@@ -230,7 +213,7 @@ pub fn collect(root: &Path) -> Result<CollectResult, String> {
 }
 
 /// The project as the methods after `collect` need it. `run` is sent a scenario id and `bivalence`
-/// a claim id, and nothing else, so the vocabulary and the claim set are read again here rather
+/// a claim name, and nothing else, so the vocabulary and the claim set are read again here rather
 /// than carried in the answer.
 pub struct Project {
     pub root: PathBuf,
@@ -246,6 +229,33 @@ impl Project {
             .filter(|claim| claim.channel.scenario.as_deref() == Some(scenario))
             .collect()
     }
+
+    /// The name the engine binds for `claim` in this project: `<subject>#<slug>` of the author's
+    /// subject name, and when two collected claims slug alike, that name plus the identity suffix on
+    /// every one of them, exactly as bind does (the renaming pass over collided ids in
+    /// `crates/veridoc-engine/src/bind.rs`). `bivalence` is addressed by name and a leaf id carries a
+    /// name, so a claim whose name collided must still be findable by the name the engine printed.
+    /// Bind drops a claim whose subject did not resolve before it suffixes, but that drop is itself a
+    /// bind error and bind errors stop the run before either method is called, so the collected set
+    /// here is the set bind named.
+    pub fn claim_name(&self, claim: &RawClaim) -> String {
+        let subject = claim.subject.subject_name();
+        let bare = ids::claim_name(subject, &claim.predicate);
+        let shared = self
+            .claims
+            .iter()
+            .filter(|other| ids::claim_name(other.subject.subject_name(), &other.predicate) == bare)
+            .count()
+            > 1;
+        if shared {
+            format!(
+                "{bare}{}",
+                ids::suffix(&ids::claim_identity(subject, &claim.predicate))
+            )
+        } else {
+            bare
+        }
+    }
 }
 
 /// Read the project for a method that runs after `collect`.
@@ -256,11 +266,6 @@ pub fn load(root: &Path) -> Result<Project, String> {
         tree,
         claims,
     })
-}
-
-/// A claim's identity, hashed the way the engine hashes it: the referent and the predicate.
-pub fn claim_id(claim: &RawClaim) -> String {
-    ids::claim_id(&claim.subject.referent_id(), &claim.predicate)
 }
 
 fn gather(root: &Path) -> Result<(Tree, Vec<RawClaim>, Vec<Skipped>), String> {
@@ -289,10 +294,7 @@ fn gather(root: &Path) -> Result<(Tree, Vec<RawClaim>, Vec<Skipped>), String> {
                     claim.channel.set()
                 ));
             }
-            let from = claim
-                .from
-                .clone()
-                .unwrap_or_else(|| described.clone());
+            let from = claim.from.clone().unwrap_or_else(|| described.clone());
             let subject = match claim.symbol {
                 Some(name) => Subject::Symbol { name, from },
                 None => Subject::Concept {
@@ -307,7 +309,6 @@ fn gather(root: &Path) -> Result<(Tree, Vec<RawClaim>, Vec<Skipped>), String> {
                 predicate: claim.predicate,
                 text: claim.text,
                 channel: claim.channel,
-                supports: claim.supports,
                 file: relative.clone(),
                 line,
             });
@@ -316,7 +317,9 @@ fn gather(root: &Path) -> Result<(Tree, Vec<RawClaim>, Vec<Skipped>), String> {
     if !sidecars_exist(root)? && claims.is_empty() {
         skipped.push(Skipped {
             file: "src".to_string(),
-            reason: format!("no *{SIDECAR_SUFFIX} file under src/, so the project declares no claim"),
+            reason: format!(
+                "no *{SIDECAR_SUFFIX} file under src/, so the project declares no claim"
+            ),
         });
     }
     Ok((tree, claims, skipped))
@@ -428,4 +431,88 @@ fn locate(text: &str, cursor: &mut usize, predicate: &str) -> usize {
 /// which arrives without a root of its own.
 pub fn concepts(root: &Path) -> Vec<String> {
     read_tree(root).0.concepts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Channel, Project, RawClaim, Subject};
+    use crate::ids;
+    use std::path::PathBuf;
+
+    /// One collected claim about `parse_config`, with only the predicate the author wrote varying.
+    fn claim(predicate: &str) -> RawClaim {
+        RawClaim {
+            kind: "requires".to_string(),
+            subject: Subject::Symbol {
+                name: "parse_config".to_string(),
+                from: "src/config.rs".to_string(),
+            },
+            concept: "configuration".to_string(),
+            predicate: predicate.to_string(),
+            text: "The parser refuses a missing project root.".to_string(),
+            channel: Channel {
+                scenario: None,
+                artefact: None,
+                citation: None,
+                asserts: None,
+            },
+            file: "src/config.claims.json".to_string(),
+            line: 1,
+        }
+    }
+
+    fn project(predicates: &[&str]) -> Project {
+        Project {
+            root: PathBuf::from("/project"),
+            tree: Default::default(),
+            claims: predicates.iter().map(|p| claim(p)).collect(),
+        }
+    }
+
+    #[test]
+    fn two_claims_that_slug_alike_are_named_apart_by_their_suffixes() {
+        let project = project(&[
+            "rejects missing project root",
+            "Rejects-Missing: PROJECT root",
+            "reports the offending path",
+        ]);
+        let first = &project.claims[0];
+        let second = &project.claims[1];
+        let bare_first = ids::claim_name(first.subject.subject_name(), &first.predicate);
+        let bare_second = ids::claim_name(second.subject.subject_name(), &second.predicate);
+        assert_eq!(bare_first, bare_second, "the two predicates slug alike");
+
+        let named_first = project.claim_name(first);
+        let named_second = project.claim_name(second);
+        assert_ne!(
+            named_first, named_second,
+            "a collided name must still reach each claim"
+        );
+        for (named, bare, claim) in [
+            (&named_first, &bare_first, first),
+            (&named_second, &bare_second, second),
+        ] {
+            assert!(
+                named.starts_with(bare) && named != bare,
+                "{named} is not {bare} plus a suffix"
+            );
+            assert_eq!(
+                named[bare.len()..],
+                ids::suffix(&ids::claim_identity(
+                    claim.subject.subject_name(),
+                    &claim.predicate
+                )),
+                "{named} carries the wrong suffix"
+            );
+        }
+
+        let third = &project.claims[2];
+        let named_third = project.claim_name(third);
+        assert_eq!(
+            named_third,
+            ids::claim_name(third.subject.subject_name(), &third.predicate),
+            "a name nothing shares keeps its bare spelling"
+        );
+        assert!(!named_third.contains('~'), "{named_third}");
+    }
 }

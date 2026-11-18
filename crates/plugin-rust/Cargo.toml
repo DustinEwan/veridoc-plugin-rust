@@ -3,7 +3,7 @@ name = "veridoc-plugin-rust"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "The veridoc plugin for Rust projects: a vd/1 plugin over the pluginrpc mechanism."
+description = "The veridoc plugin for Rust projects: a veridoc/1 plugin over the pluginrpc mechanism."
 
 [[bin]]
 name = "veridoc-plugin-rust"

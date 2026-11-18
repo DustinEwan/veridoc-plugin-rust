@@ -1,4 +1,4 @@
-//! veridoc-plugin-rust: the `vd/1` plugin for Rust projects, spoken over the pluginrpc
+//! veridoc-plugin-rust: the `veridoc/1` plugin for Rust projects, spoken over the pluginrpc
 //! mechanism (`prpc/1`).
 //!
 //! The wire layer is the mechanism's own crate, so the framing, the envelope, the reserved id,
@@ -23,15 +23,15 @@ use plugin_rpc::{
 
 /// The profile this plugin answers. The mechanism uses this string to select the method set and
 /// the payload types (§6), so it is the first thing a host checks.
-const PROTOCOL_VERSION: &str = "vd/1";
+const PROTOCOL_VERSION: &str = "veridoc/1";
 
-/// The capabilities this build answers. Every name here is in `vd-1.profile.json`'s vocabulary,
-/// and a method whose capability is absent is answered `-32601` rather than with an invented
+/// The capabilities this build answers. Every name here is in `veridoc-1.profile.json`'s
+/// vocabulary, and a method whose capability is absent is answered `-32601` rather than with an
 /// result, because the profile defines what an absent capability costs and a made-up answer does
 /// not appear in that list.
 const CAPABILITIES: &[&str] = &["collect", "resolution", "bivalence", "execution"];
 
-/// The `vd/1` method vocabulary. The mechanism transports these strings and gives them no
+/// The `veridoc/1` method vocabulary. The mechanism transports these strings and gives them no
 /// meaning; `from_wire` is what turns a name outside the profile into a `-32601` (§9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Method {
@@ -162,9 +162,9 @@ fn dispatch(line: &str, root: &mut Option<PathBuf>) -> Response {
                 );
             };
             match param_string(&request, "claimId", "claimId is required") {
-                Ok(claim_id) => match project::load(&project_root) {
+                Ok(claim_name) => match project::load(&project_root) {
                     Ok(loaded) => {
-                        Response::result(request.id, bivalence::bivalence(&loaded, &claim_id))
+                        Response::result(request.id, bivalence::bivalence(&loaded, &claim_name))
                     }
                     Err(reason) => Response::refusal(request.id, PLUGIN_ERROR, reason),
                 },
@@ -230,8 +230,7 @@ fn param_string(request: &Request, key: &str, missing: &str) -> Result<String, S
 /// failure, because `run-request.json` fixes the shape and a plugin that guesses which scenario
 /// the engine meant reports a verdict for the wrong claim.
 fn run_params(request: &Request) -> Result<run::Request, String> {
-    const MISSING: &str =
-        "run requires scenarioId, fixture, action, args, deadlineMs, and leaves";
+    const MISSING: &str = "run requires scenarioId, fixture, action, args, deadlineMs, and leaves";
     let Some(params) = request.params.as_ref() else {
         return Err(MISSING.to_string());
     };
@@ -308,7 +307,7 @@ fn param_strings(request: &Request, key: &str, missing: &str) -> Result<Vec<Stri
         .collect()
 }
 
-/// The handshake result: the four fields the mechanism owns, plus `languages`, which `vd/1`
+/// The handshake result: the four fields the mechanism owns, plus `languages`, which `veridoc/1`
 /// requires and the mechanism's open envelope allows (§6). `handshake.json` sets
 /// `additionalProperties: false`, so these five are the whole object.
 fn handshake() -> serde_json::Value {

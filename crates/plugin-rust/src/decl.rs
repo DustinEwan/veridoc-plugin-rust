@@ -24,7 +24,9 @@ pub struct Declaration {
     pub line: usize,
 }
 
-const KEYWORDS: [&str; 8] = ["fn", "struct", "enum", "trait", "const", "static", "type", "mod"];
+const KEYWORDS: [&str; 8] = [
+    "fn", "struct", "enum", "trait", "const", "static", "type", "mod",
+];
 
 /// Read `path` and return every item declaration in it.
 pub fn declarations_in(path: &Path) -> Result<Vec<Declaration>, String> {

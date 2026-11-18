@@ -7,27 +7,27 @@
 //! pass on every run. A tree containing a `satisfies` leaf is answered `false` rather than
 //! guessed, because settling that leaf means deciding a Rust predicate's two outcomes without
 //! running them, which this plugin does not claim to do. The engine then refuses the claim the
-//! scenario channel and says why (`vd-1.profile.json`, `bivalence.ifAbsent`), which is more use
-//! to the author than a verdict the plugin cannot support.
+//! scenario channel and says why (`veridoc-1.profile.json`, `bivalence.ifAbsent`), which is more
+//! use to the author than a verdict the plugin cannot support.
 
 use serde_json::{json, Value};
 
-use crate::project::{self, Project};
+use crate::project::Project;
 use crate::run::leaves;
 
-/// Answer `bivalence` for one claim id. An unknown id is a normal answer, not a refusal: the
+/// Answer `bivalence` for one claim name. An unknown name is a normal answer, not a refusal: the
 /// engine is asking about a claim it believes it bound, and a `false` with the reason reaches the
 /// author as a diagnostic, where a `-32000` reaches them as a plugin failure.
-pub fn bivalence(project: &Project, claim_id: &str) -> Value {
+pub fn bivalence(project: &Project, claim_name: &str) -> Value {
     let Some(claim) = project
         .claims
         .iter()
-        .find(|candidate| project::claim_id(candidate) == claim_id)
+        .find(|candidate| project.claim_name(candidate) == claim_name)
     else {
         return json!({
             "bivalent": false,
             "method": "structural",
-            "reason": format!("no claim {claim_id} was collected from this project"),
+            "reason": format!("no claim {claim_name} was collected from this project"),
         });
     };
     let checks: Vec<&Value> = claim

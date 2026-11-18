@@ -8,7 +8,7 @@ scenarios. Verdicts come from veridoc's engine, which does not read Rust.
 
 The wire mechanism, the envelope, and the conformance rules come from
 [pluginrpc](https://github.com/DustinEwan/pluginrpc), which is where the `prpc/1` framing is defined.
-This repository owns the `vd/1` method vocabulary, the claim format for Rust, and the answers.
+This repository owns the `veridoc/1` method vocabulary, the claim format for Rust, and the answers.
 
 ## What you add to your project
 
@@ -20,15 +20,17 @@ source, and the scenario harness is a binary that you write and veridoc runs.
 | `.veridoc/config.json` | The plugin command, the coverage floor, the scenario deadline, and the judge |
 | `veridoc.tree.json` | The concepts, the document tree, the observables, the actions, the fixtures, and the harness name |
 | `src/<module>.claims.json` | The claims about that module, one sidecar per module |
-| `docs/*.spec.md` | The prose, in sections that select claims by heading attribute |
+| `docs/*.spec.md` | The prose, in `<doc-section>` sections that name claims with `<doc-claim>` |
 | `features/*.feature` | The scenarios: a `@id:` tag, a `Given` that names a fixture, a `When` that names an action |
 | `src/bin/<harness>.rs` | The scenario harness, about twenty lines |
 
 ### The claims
 
 You write the symbol and the predicate. The plugin records the referent, the file, and the line.
-After you rename a symbol, the sidecar still refers to the old one, and the run reports it as
-unresolved instead of reading the sentence as still describing whatever now occupies the file.
+The claim's name is `<subject>#<predicate>`, so the example below is `parse_config#rejects-missing-config`
+wherever a report, a `<doc-claim>`, or a leaf id prints it. After you rename a symbol, the sidecar still
+refers to the old one, and the run reports it as unresolved instead of reading the sentence as still
+describing whatever now occupies the file.
 
 ```json
 {
@@ -48,6 +50,26 @@ A claim carries exactly one channel: a scenario with its assertion tree, an arte
 hash, or a citation. If a sidecar sets two channels, the plugin stops and reports the file, because
 the engine's error for that case arrives later and points at the claim rather than at the line you
 wrote.
+
+### The prose
+
+A section opens with `<doc-section name="SUBJECT">` alone on a line and ends at the next opener or the end
+of the file. A heading inside it is prose and means nothing to the engine. A `<doc-claim name="PREDICATE"/>`
+written inside a sentence names one claim, and the claim it names is `SUBJECT#PREDICATE`: the subject half
+from the opening element, the predicate half the slug the report prints for the claim. Both directions are
+checked, so a reference that names no claim stops the run and so does a claim that no section names. The
+subject is the name you wrote for the thing the prose is about — the symbol for a claim about a symbol, the
+concept for a claim about a concept, so the example's two sections open with `parse_config` and
+`project-scan`. The referent id the plugin hashes from the file path (`veridoc:referent:` plus twelve hex
+digits) is what `resolve` reports and nothing more, so renaming the file that holds the code costs a rebuild
+and moves no claim name.
+
+A fact your code decides does not belong in prose you copy: `<doc-each source="observables">` on a line of
+its own repeats the one block after it once per value the collection holds, and `<doc-value field="name"/>`
+marks where each value lands. The example's second section pulls in the observables this plugin declares.
+The authored file keeps the placeholder and the engine never writes into it; the assembled values appear in
+the report, and they are inside the hash that decides whether the section is re-judged. The collections and
+their fields are in `../veridoc/docs/spec.md`.
 
 ### The scenario harness
 
@@ -140,7 +162,7 @@ The plugin passes the mechanism's core rules:
 
 ```sh
 cargo run --manifest-path ../pluginrpc/Cargo.toml --bin prpc-core -- \
-  ../veridoc/vd-1.profile.json veridoc-plugin.json
+  ../veridoc/veridoc-1.profile.json veridoc-plugin.json
 ```
 
 ## Layout
