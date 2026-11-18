@@ -1,0 +1,6 @@
+{
+  "name": "veridoc-plugin-rust",
+  "install": [],
+  "build": [["cargo", "build", "--release"]],
+  "command": ["target/release/veridoc-plugin-rust"]
+}
