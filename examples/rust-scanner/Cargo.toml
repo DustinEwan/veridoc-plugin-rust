@@ -1,0 +1,13 @@
+[package]
+name = "scanner"
+version = "0.1.0"
+edition = "2021"
+
+# The scenario harness is an ordinary `src/bin` binary, so Cargo discovers it without a `[[bin]]`
+# section and veridoc builds it by name from `veridoc.tree.json`.
+[dependencies]
+serde_json = "1.0"
+
+# Its own workspace root: the plugin builds this example with its own target directory, and the
+# plugin repository must not become its workspace.
+[workspace]

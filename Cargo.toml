@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/plugin-rust"]
+# The example projects are separate crates: veridoc builds them, and the plugin must not be
+# rebuilt when an author builds their own project.
+exclude = ["examples/*"]
 
 [workspace.package]
 version = "0.1.0"

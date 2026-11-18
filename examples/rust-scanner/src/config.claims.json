@@ -6,7 +6,10 @@
       "concept": "project-scan",
       "predicate": "rejects-missing-config",
       "text": "parse_config refuses a directory that holds no config.json, naming the directory in the message.",
-      "channel": { "scenario": "config/rejects-missing" }
+      "channel": {
+        "scenario": "config/rejects-missing",
+        "asserts": { "obs": "exit_code", "is": { "equals": 2 } }
+      }
     },
     {
       "kind": "requires",
@@ -14,14 +17,22 @@
       "concept": "project-scan",
       "predicate": "takes-one-directory",
       "text": "parse_config is given exactly one directory and never searches for another.",
-      "channel": { "scenario": "config/one-directory" }
+      "channel": {
+        "scenario": "config/one-directory",
+        "asserts": {
+          "all": [
+            { "obs": "exit_code", "is": { "equals": 0 } },
+            { "obs": "message", "is": { "equals": "" } }
+          ]
+        }
+      }
     },
     {
       "kind": "invariant",
       "concept": "project-scan",
       "predicate": "names-what-it-refused",
       "text": "Every refusal the scanner reports names the directory it refused.",
-      "channel": { "artefact": { "path": "evidence/refusals.txt", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" } }
+      "channel": { "artefact": { "path": "evidence/refusals.txt", "sha256": "338af92b1cc980c1b4e0f307d5f9f3611a37fce854c35ffd4cb07d2c3e2fa00f" } }
     }
   ]
 }

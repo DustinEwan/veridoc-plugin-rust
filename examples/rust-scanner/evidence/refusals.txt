@@ -1,0 +1,3 @@
+Every refusal the scanner reports names the directory it refused. Captured from the harness:
+
+  fixtures/empty-directory  ->  fixtures/empty-directory holds no config.json

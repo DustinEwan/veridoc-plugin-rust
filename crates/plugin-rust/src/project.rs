@@ -16,6 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use crate::ids;
 
 /// The vocabulary and document-tree file, read from the project root.
 pub const TREE_FILE: &str = "veridoc.tree.json";
@@ -37,7 +38,7 @@ pub struct CollectResult {
 
 /// One claim as `collect` reports it. `file` and `line` are the sidecar's, so the diagnostic the
 /// author is sent lands on the line they wrote.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RawClaim {
     pub kind: String,
@@ -60,6 +61,17 @@ pub enum Subject {
     Symbol { name: String, from: String },
     #[serde(rename = "concept")]
     Concept { name: String },
+}
+
+impl Subject {
+    /// The referent identity the engine stores for this subject: the symbol's file and name, or
+    /// the concept's name. A claim's id is hashed from this and its predicate.
+    pub fn referent_id(&self) -> String {
+        match self {
+            Subject::Symbol { name, from } => ids::referent_id(from, name),
+            Subject::Concept { name } => ids::concept_id(name),
+        }
+    }
 }
 
 /// The channel a claim's evidence arrives on. Exactly one field is set; the engine rejects a
@@ -95,11 +107,14 @@ pub struct Citation {
 }
 
 impl Channel {
+    /// How many of the three channels are populated. `scenario` and `asserts` are one channel --
+    /// the assertion tree is the scenario's evidence, not a second channel (`contract.rs:104-113`)
+    /// -- so a claim that names a scenario and its assertion tree counts once, and one that adds an
+    /// artefact counts twice and is refused.
     fn set(&self) -> usize {
-        usize::from(self.scenario.is_some())
+        usize::from(self.scenario.is_some() || self.asserts.is_some())
             + usize::from(self.artefact.is_some())
             + usize::from(self.citation.is_some())
-            + usize::from(self.asserts.is_some())
     }
 }
 
@@ -163,6 +178,10 @@ pub struct Tree {
     pub observables: Vec<ObservableDecl>,
     pub actions: Vec<ActionDecl>,
     pub fixtures: Vec<String>,
+    /// The harness binary `run` builds and executes. A project that declares none can still make
+    /// every claim, but a scenario-channel claim cannot be run, and the run failure says so.
+    #[serde(default)]
+    pub harness: Option<String>,
 }
 
 /// One sidecar file.
@@ -198,6 +217,53 @@ const KINDS: [&str; 5] = ["requires", "ensures", "invariant", "witness", "becaus
 /// or that declares a claim with two channels or none, is an error: the author is better served
 /// by a refusal naming the file and the reason than by a claim set with a hole in it.
 pub fn collect(root: &Path) -> Result<CollectResult, String> {
+    let (tree, claims, skipped) = gather(root)?;
+    Ok(CollectResult {
+        concepts: tree.concepts,
+        documents: tree.documents,
+        claims,
+        observables: tree.observables,
+        actions: tree.actions,
+        fixtures: tree.fixtures,
+        skipped,
+    })
+}
+
+/// The project as the methods after `collect` need it. `run` is sent a scenario id and `bivalence`
+/// a claim id, and nothing else, so the vocabulary and the claim set are read again here rather
+/// than carried in the answer.
+pub struct Project {
+    pub root: PathBuf,
+    pub tree: Tree,
+    pub claims: Vec<RawClaim>,
+}
+
+impl Project {
+    /// The claims whose scenario channel is `scenario`, in sidecar order.
+    pub fn scenario(&self, scenario: &str) -> Vec<&RawClaim> {
+        self.claims
+            .iter()
+            .filter(|claim| claim.channel.scenario.as_deref() == Some(scenario))
+            .collect()
+    }
+}
+
+/// Read the project for a method that runs after `collect`.
+pub fn load(root: &Path) -> Result<Project, String> {
+    let (tree, claims, _skipped) = gather(root)?;
+    Ok(Project {
+        root: root.to_path_buf(),
+        tree,
+        claims,
+    })
+}
+
+/// A claim's identity, hashed the way the engine hashes it: the referent and the predicate.
+pub fn claim_id(claim: &RawClaim) -> String {
+    ids::claim_id(&claim.subject.referent_id(), &claim.predicate)
+}
+
+fn gather(root: &Path) -> Result<(Tree, Vec<RawClaim>, Vec<Skipped>), String> {
     let (tree, mut skipped) = read_tree(root);
     let mut claims = Vec::new();
     for sidecar in sidecars(root)? {
@@ -217,8 +283,8 @@ pub fn collect(root: &Path) -> Result<CollectResult, String> {
             }
             if claim.channel.set() != 1 {
                 return Err(format!(
-                    "{relative}: claim {:?} sets {} channel fields; exactly one of scenario, \
-                     artefact, citation, or asserts is the channel",
+                    "{relative}: claim {:?} sets {} channels; exactly one is the channel, and it \
+                     is scenario with its asserts, artefact, or citation",
                     claim.predicate,
                     claim.channel.set()
                 ));
@@ -253,15 +319,7 @@ pub fn collect(root: &Path) -> Result<CollectResult, String> {
             reason: format!("no *{SIDECAR_SUFFIX} file under src/, so the project declares no claim"),
         });
     }
-    Ok(CollectResult {
-        concepts: tree.concepts,
-        documents: tree.documents,
-        claims,
-        observables: tree.observables,
-        actions: tree.actions,
-        fixtures: tree.fixtures,
-        skipped,
-    })
+    Ok((tree, claims, skipped))
 }
 
 /// The vocabulary file, and the `skipped` entry it earns when it is missing.

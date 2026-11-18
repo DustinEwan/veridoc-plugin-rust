@@ -5,10 +5,12 @@
 //! and the refusal codes here are the same code a host uses to check them. What this repository
 //! owns is the method vocabulary, the claim format in Rust source, and the answers.
 
+mod bivalence;
 mod decl;
 mod ids;
 mod project;
 mod resolve;
+mod run;
 
 use std::io::{self, Write};
 
@@ -27,7 +29,7 @@ const PROTOCOL_VERSION: &str = "vd/1";
 /// and a method whose capability is absent is answered `-32601` rather than with an invented
 /// result, because the profile defines what an absent capability costs and a made-up answer does
 /// not appear in that list.
-const CAPABILITIES: &[&str] = &["collect", "resolution"];
+const CAPABILITIES: &[&str] = &["collect", "resolution", "bivalence", "execution"];
 
 /// The `vd/1` method vocabulary. The mechanism transports these strings and gives them no
 /// meaning; `from_wire` is what turns a name outside the profile into a `-32601` (§9).
@@ -151,13 +153,48 @@ fn dispatch(line: &str, root: &mut Option<PathBuf>) -> Response {
                 Err(reason) => Response::refusal(request.id, INVALID_REQUEST, reason),
             }
         }
+        Some(Method::Bivalence) => {
+            let Some(project_root) = root.clone() else {
+                return Response::refusal(
+                    request.id,
+                    PLUGIN_ERROR,
+                    "collect has not run, so there is no claim set to settle bivalence against",
+                );
+            };
+            match param_string(&request, "claimId", "claimId is required") {
+                Ok(claim_id) => match project::load(&project_root) {
+                    Ok(loaded) => {
+                        Response::result(request.id, bivalence::bivalence(&loaded, &claim_id))
+                    }
+                    Err(reason) => Response::refusal(request.id, PLUGIN_ERROR, reason),
+                },
+                Err(reason) => Response::refusal(request.id, INVALID_REQUEST, reason),
+            }
+        }
+        Some(Method::Run) => {
+            let Some(project_root) = root.clone() else {
+                return Response::refusal(
+                    request.id,
+                    PLUGIN_ERROR,
+                    "collect has not run, so there is no vocabulary to run a scenario from",
+                );
+            };
+            let params = match run_params(&request) {
+                Ok(params) => params,
+                Err(reason) => return Response::refusal(request.id, INVALID_REQUEST, reason),
+            };
+            match project::load(&project_root) {
+                Ok(loaded) => Response::result(request.id, run::run(&loaded, &params)),
+                Err(reason) => Response::refusal(request.id, PLUGIN_ERROR, reason),
+            }
+        }
         Some(method) => Response::refusal(
             request.id,
             METHOD_NOT_FOUND,
             format!(
-                "veridoc-plugin-rust {} declares {} and answers no {}",
+                "veridoc-plugin-rust {} declares {:?} and answers no {}",
                 env!("CARGO_PKG_VERSION"),
-                CAPABILITIES.join(" and "),
+                CAPABILITIES,
                 method.name(),
             ),
         ),
@@ -175,6 +212,81 @@ fn param_path(request: &Request, key: &str, missing: &str) -> Result<PathBuf, St
         .filter(|value| !value.is_empty())
         .ok_or_else(|| missing.to_string())?;
     Ok(PathBuf::from(value))
+}
+
+/// One string parameter.
+fn param_string(request: &Request, key: &str, missing: &str) -> Result<String, String> {
+    request
+        .params
+        .as_ref()
+        .and_then(|params| params.get(key))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| missing.to_string())
+}
+
+/// The `run` parameters. A missing or mistyped field is an invalid request rather than a run
+/// failure, because `run-request.json` fixes the shape and a plugin that guesses which scenario
+/// the engine meant reports a verdict for the wrong claim.
+fn run_params(request: &Request) -> Result<run::Request, String> {
+    const MISSING: &str =
+        "run requires scenarioId, fixture, action, args, deadlineMs, and leaves";
+    let Some(params) = request.params.as_ref() else {
+        return Err(MISSING.to_string());
+    };
+    let text = |key: &str| {
+        params
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let (Some(scenario_id), Some(fixture), Some(action)) =
+        (text("scenarioId"), text("fixture"), text("action"))
+    else {
+        return Err(MISSING.to_string());
+    };
+    let args = strings(params, "args")?;
+    let deadline_ms = params
+        .get("deadlineMs")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{MISSING}; deadlineMs must be a number"))?;
+    let leaves = params
+        .get("leaves")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{MISSING}; leaves must be an array of objects"))?
+        .iter()
+        .map(|leaf| {
+            leaf.get("leafId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "each leaf must carry a leafId".to_string())
+        })
+        .collect::<Result<Vec<String>, String>>()?;
+    Ok(run::Request {
+        scenario_id,
+        fixture,
+        action,
+        args,
+        deadline_ms,
+        leaves,
+    })
+}
+
+/// One array-of-strings parameter, read from an already-held `params` object.
+fn strings(params: &serde_json::Value, key: &str) -> Result<Vec<String>, String> {
+    params
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{key} must be an array of strings"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("{key} must be an array of strings"))
+        })
+        .collect()
 }
 
 /// One array-of-strings parameter.

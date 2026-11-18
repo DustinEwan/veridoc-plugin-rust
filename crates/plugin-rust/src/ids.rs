@@ -4,7 +4,9 @@
 //! the construction the TypeScript plugin uses (`packages/plugin-ts/src/ids.ts:10-15`), so the
 //! same-named item in two files gets two identities. The signature is excluded on purpose: a
 //! signature edit must not move a claim's identity and with it its verdict cache. A concept has
-//! no file, so it carries `vd:c:` instead of a discriminator that could collide with a path.
+//! A claim's id is the engine's own hash, `c + hex16(sha256(referent_id + "\u{0}" + predicate))`
+//! (`crates/veridoc-engine/src/hash.rs:12-22`). `run` addresses a leaf as `<claim id>#l<n>`, so a
+//! plugin that cannot recompute the id cannot find the claim the leaf belongs to.
 
 use sha2::{Digest, Sha256};
 
@@ -18,17 +20,31 @@ pub fn concept_id(name: &str) -> String {
     hashed("vd:c:", "", name)
 }
 
+/// A claim's identity, recomputed exactly as the engine computes it.
+pub fn claim_id(referent: &str, predicate: &str) -> String {
+    format!("c{}", &joined(referent, predicate)[..16])
+}
+
 fn hashed(prefix: &str, discriminator: &str, name: &str) -> String {
+    format!("{prefix}{}", &joined(discriminator, name)[..12])
+}
+
+/// `hex(sha256(a + "\u{0}" + b))`, the digest every identity in this file is cut from. The hex
+/// is ASCII, so the callers above can slice it by byte index.
+fn joined(a: &str, b: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(discriminator.as_bytes());
+    hasher.update(a.as_bytes());
     hasher.update([0u8]);
-    hasher.update(name.as_bytes());
-    let digest = hasher.finalize();
+    hasher.update(b.as_bytes());
+    hex(&hasher.finalize())
+}
+
+fn hex(digest: &[u8]) -> String {
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
         hex.push_str(&format!("{byte:02x}"));
     }
-    format!("{prefix}{}", &hex[..12])
+    hex
 }
 
 #[cfg(test)]
