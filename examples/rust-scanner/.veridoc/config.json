@@ -1,0 +1,12 @@
+{
+  "protocol": "vd/1",
+  "plugin": { "command": ["../../target/release/veridoc-plugin-rust"] },
+  "coverage": { "required": 0.0 },
+  "run": { "scenarioDeadlineMs": 30000 },
+  "judge": {
+    "transport": "command",
+    "command": ["node", "-e", "process.stdin.on('data',()=>{});process.on('exit',()=>{})"],
+    "model": "unused-by-probe"
+  },
+  "output": { "dir": ".veridoc/out", "formatters": [] }
+}

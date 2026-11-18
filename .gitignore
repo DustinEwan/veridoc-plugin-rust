@@ -1,1 +1,5 @@
 /target
+examples/*/.veridoc/out/
+examples/*/.veridoc/verdicts/
+examples/*/.veridoc/result.json
+examples/*/.veridoc/last-result-hash

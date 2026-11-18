@@ -1,0 +1,20 @@
+{
+  "concepts": ["project-scan"],
+  "documents": [
+    {
+      "path": "docs/architecture.spec.md",
+      "audience": "a developer extending the scanner",
+      "question": "What does the scanner refuse, and on what evidence?",
+      "selects": { "concept": "project-scan" }
+    }
+  ],
+  "observables": [{ "name": "exit_code", "type": "number" }],
+  "actions": [
+    {
+      "name": "run-scanner",
+      "calls": { "kind": "symbol", "name": "parse_config", "from": "src/config.rs" },
+      "produces": ["exit_code"]
+    }
+  ],
+  "fixtures": ["fixtures/empty-directory"]
+}

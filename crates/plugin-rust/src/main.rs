@@ -5,11 +5,18 @@
 //! and the refusal codes here are the same code a host uses to check them. What this repository
 //! owns is the method vocabulary, the claim format in Rust source, and the answers.
 
+mod decl;
+mod ids;
+mod project;
+mod resolve;
+
 use std::io::{self, Write};
 
+use std::path::PathBuf;
+
 use plugin_rpc::{
-    buffered, buffered_writer, parse_request, read_line, write_line, MethodName, Response,
-    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
+    buffered, buffered_writer, parse_request, read_line, write_line, MethodName, Request, Response,
+    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, PLUGIN_ERROR,
 };
 
 /// The profile this plugin answers. The mechanism uses this string to select the method set and
@@ -20,7 +27,7 @@ const PROTOCOL_VERSION: &str = "vd/1";
 /// and a method whose capability is absent is answered `-32601` rather than with an invented
 /// result, because the profile defines what an absent capability costs and a made-up answer does
 /// not appear in that list.
-const CAPABILITIES: &[&str] = &[];
+const CAPABILITIES: &[&str] = &["collect", "resolution"];
 
 /// The `vd/1` method vocabulary. The mechanism transports these strings and gives them no
 /// meaning; `from_wire` is what turns a name outside the profile into a `-32601` (§9).
@@ -73,14 +80,19 @@ fn main() {
 
 /// Read requests from stdin and answer them on stdout until the host closes the pipe. A blank
 /// line or an end of file ends the connection (§3); neither is an error to report.
+///
+/// `root` is the project the last `collect` read. `resolve` is sent only `refs`
+/// (`resolve-req.json` allows nothing else), so the project it settles them against is the one
+/// `collect` reported, and a `resolve` before any `collect` is refused rather than guessed.
 fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = buffered(stdin.lock());
     let mut writer = buffered_writer(stdout.lock());
     let mut buf = String::new();
+    let mut root: Option<PathBuf> = None;
     while let Some(line) = read_line(&mut reader, &mut buf)? {
-        let response = dispatch(&line);
+        let response = dispatch(&line, &mut root);
         write_line(&mut writer, &response)?;
     }
     writer.flush()?;
@@ -89,7 +101,7 @@ fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Answer one line. Every path returns a response: a plugin that stays silent on a message it
 /// cannot use leaves the host waiting for a deadline instead of reading a reason (§5).
-fn dispatch(line: &str) -> Response {
+fn dispatch(line: &str, root: &mut Option<PathBuf>) -> Response {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         return Response::uncorrelated(PARSE_ERROR, "the line is not JSON");
     };
@@ -113,18 +125,75 @@ fn dispatch(line: &str) -> Response {
             METHOD_NOT_FOUND,
             format!("{} is not a method of {}", request.method, PROTOCOL_VERSION),
         ),
+        Some(Method::Collect) => match param_path(&request, "root", "root is required") {
+            Ok(project_root) => match project::collect(&project_root) {
+                Ok(result) => {
+                    *root = Some(project_root);
+                    Response::result(request.id, result)
+                }
+                Err(reason) => Response::refusal(request.id, PLUGIN_ERROR, reason),
+            },
+            Err(reason) => Response::refusal(request.id, INVALID_REQUEST, reason),
+        },
+        Some(Method::Resolve) => {
+            let Some(project_root) = root.clone() else {
+                return Response::refusal(
+                    request.id,
+                    PLUGIN_ERROR,
+                    "collect has not run, so there is no project to settle references in",
+                );
+            };
+            match param_strings(&request, "refs", "refs must be an array of strings") {
+                Ok(refs) => Response::result(
+                    request.id,
+                    resolve::resolve(&project_root, &refs, &project::concepts(&project_root)),
+                ),
+                Err(reason) => Response::refusal(request.id, INVALID_REQUEST, reason),
+            }
+        }
         Some(method) => Response::refusal(
             request.id,
             METHOD_NOT_FOUND,
             format!(
-                "veridoc-plugin-rust {} answers no {} yet; it declares the capabilities {:?}, \
-                 and the profile defines what each absent one costs",
+                "veridoc-plugin-rust {} declares {} and answers no {}",
                 env!("CARGO_PKG_VERSION"),
+                CAPABILITIES.join(" and "),
                 method.name(),
-                CAPABILITIES,
             ),
         ),
     }
+}
+
+/// One path parameter. The engine sends the project root absolute; a relative value is read
+/// against the working directory the host started the plugin in, which is the project root.
+fn param_path(request: &Request, key: &str, missing: &str) -> Result<PathBuf, String> {
+    let value = request
+        .params
+        .as_ref()
+        .and_then(|params| params.get(key))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| missing.to_string())?;
+    Ok(PathBuf::from(value))
+}
+
+/// One array-of-strings parameter.
+fn param_strings(request: &Request, key: &str, missing: &str) -> Result<Vec<String>, String> {
+    let values = request
+        .params
+        .as_ref()
+        .and_then(|params| params.get(key))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| missing.to_string())?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| missing.to_string())
+        })
+        .collect()
 }
 
 /// The handshake result: the four fields the mechanism owns, plus `languages`, which `vd/1`
