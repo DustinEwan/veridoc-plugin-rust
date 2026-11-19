@@ -14,7 +14,7 @@ for another. It refuses a directory that holds no `config.json` <doc-claim name=
 The message of every refusal names the directory it refused <doc-claim name="names-what-it-refused"/>, and
 `evidence/refusals.txt` is the artefact that collects them.
 
-The plugin declares these observables, and a scenario may assert on any of them:
+The claims this section states, and the evidence each one rests on:
 
-<doc-each source="observables">
-- `<doc-value field="name"/>` of type `<doc-value field="type"/>`
+<doc-each source="claims">
+- `<doc-value field="predicate"/>`: <doc-value field="text"/> (channel: <doc-value field="channel"/>)

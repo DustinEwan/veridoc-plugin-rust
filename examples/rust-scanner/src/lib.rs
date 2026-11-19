@@ -1,5 +1,5 @@
-//! The scanner example: one module, so the fixture shows the whole shape of a Rust project that
-//! adopts veridoc. The library target is what the scenario harness calls.
+//! The scanner example: one module, so the example shows the whole shape of a Rust project that
+//! adopts veridoc. The library target is what the claim module's scenarios call.
 
 pub mod config;
 
