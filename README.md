@@ -30,6 +30,10 @@ reads the one item out of it. There is no source-root list: the plugin walks eve
 every Cargo package under your project and prunes `target`, `.veridoc`, and `.git`, because a
 project's layout is a property of its package manager rather than something you restate.
 
+The harness target sits in a Cargo package, because a workspace root that only lists `members` owns no
+target: `init` writes `examples/veridoc.rs` into the first package with a `src` directory, and the
+plugin builds it from the manifest that owns it.
+
 ### The claims
 
 You write the symbol and the predicate. The plugin records the referent, the file, and the line. The
