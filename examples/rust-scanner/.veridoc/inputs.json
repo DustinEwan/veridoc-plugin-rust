@@ -1,6 +1,10 @@
 {
   "files": [
     {
+      "path": ".gitignore",
+      "sha256": "44c92e3a70ad3307b7056871c2bdb096d8bfa9373f5bf06a79bb6324a20ff2fb"
+    },
+    {
       "path": ".veridoc/config.json",
       "sha256": "995a1126027f9b819d417ce4ebc1ed9182f2903e0c75e1452ffefb9648b3992d"
     },
