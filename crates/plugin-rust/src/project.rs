@@ -466,6 +466,52 @@ pub fn sources(root: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Every Cargo package directory of the project, the root included when the root is itself a
+/// package. A workspace root that only lists `members` owns no target, so a harness example that
+/// sits there belongs to nothing and cannot be built; the plugin finds the owner by this walk rather
+/// than by a manifest field the author would have to restate (`docs/decisions/0006:168-173`).
+pub fn packages(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if is_package(root) {
+        found.push(root.to_path_buf());
+    }
+    walk_manifests(root, &mut found);
+    found.sort();
+    found
+}
+
+/// Whether `dir` holds the manifest of a package, as against a virtual workspace root. `init` uses
+/// this to decide where the harness target goes.
+pub(crate) fn is_package(dir: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(dir.join("Cargo.toml")) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let header = line.trim();
+        header == "[package]" || header.starts_with("[package.")
+    })
+}
+
+fn walk_manifests(dir: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut children: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+    children.sort();
+    for child in children {
+        let Some(name) = child.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !child.is_dir() || PRUNED_DIRS.contains(&name) {
+            continue;
+        }
+        if is_package(&child) {
+            found.push(child.clone());
+        }
+        walk_manifests(&child, found);
+    }
+}
+
 fn walk(dir: &Path, suffix: &str, found: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -579,5 +625,34 @@ mod tests {
             serde_json::from_str("{\"asserts\":null,\"artefact\":{\"path\":\"a\",\"sha256\":\"b\"},\"citation\":{\"store\":\"s\",\"id\":\"i\"}}")
                 .unwrap();
         assert_eq!(two.set(), 2);
+    }
+
+    /// The plugin builds the harness example from the manifest that owns it, so the walk has to name
+    /// a member for a virtual workspace and the root for a project that is one package.
+    #[test]
+    fn the_packages_of_a_virtual_workspace_are_its_members_and_not_its_root() {
+        let root = std::env::temp_dir().join(format!("veridoc-packages-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/one\"]\n",
+        );
+        write(
+            &root.join("crates/one/Cargo.toml"),
+            "[package]\nname = \"one\"\n",
+        );
+        write(&root.join("crates/one/src/lib.rs"), "");
+        assert_eq!(packages(&root), vec![root.join("crates/one")]);
+        write(
+            &root.join("Cargo.toml"),
+            "[package]\nname = \"root-crate\"\n",
+        );
+        assert_eq!(packages(&root), vec![root.clone(), root.join("crates/one")]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn write(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().expect("a manifest has a parent")).unwrap();
+        fs::write(path, text).unwrap();
     }
 }

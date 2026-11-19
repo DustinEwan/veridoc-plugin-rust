@@ -246,15 +246,18 @@ fn build_harness(root: &Path) -> Result<PathBuf, String> {
             root.display()
         ));
     }
-    let example = root.join("examples").join(format!("{HARNESS_EXAMPLE}.rs"));
-    if !example.is_file() {
+    // The example has to belong to a Cargo package. A workspace root that only lists `members` owns
+    // no target, and building the example there answers "no example target named veridoc in
+    // default-run packages", so the plugin looks for the file among the project's packages and names
+    // the manifest that owns it (`docs/decisions/0006:168-173`).
+    let Some(owner) = harness_owner(root) else {
         return Err(format!(
-            "the project ships no {}, so the plugin cannot ask it what its claim modules declare; \
-             the harness is one call into the veridoc-claims library",
-            project::relative(root, &example)
+            "the project ships no examples/{HARNESS_EXAMPLE}.rs, so the plugin cannot ask it what its \
+             claim modules declare; the harness is one call into the veridoc-claims library"
         ));
-    }
-    let built = Command::new("cargo")
+    };
+    let mut build = Command::new("cargo");
+    build
         .arg("build")
         .arg("--release")
         .arg("--offline")
@@ -264,8 +267,11 @@ fn build_harness(root: &Path) -> Result<PathBuf, String> {
         .arg(HARNESS_TARGET_DIR)
         .current_dir(root)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+        .stderr(Stdio::piped());
+    if owner != root {
+        build.arg("--manifest-path").arg(owner.join("Cargo.toml"));
+    }
+    let built = build.output();
     let output = match built {
         Ok(output) => output,
         Err(e) => {
@@ -293,6 +299,15 @@ fn build_harness(root: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(binary)
+}
+
+/// The package whose `examples/veridoc.rs` the plugin builds, or none when the project ships no
+/// harness target at all.
+fn harness_owner(root: &Path) -> Option<PathBuf> {
+    let file = format!("{HARNESS_EXAMPLE}.rs");
+    project::packages(root)
+        .into_iter()
+        .find(|package| package.join("examples").join(&file).is_file())
 }
 
 /// Run the harness under a deadline, from the project root, so a scenario that opens an asset of the

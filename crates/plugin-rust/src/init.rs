@@ -1,8 +1,9 @@
-//! `init`: create the files only this plugin can create — `veridoc.tree.json`, the document tree
-//! `collect` reads, and the prose file the requested document names. The host writes neither, because
-//! a host that authors a file it cannot parse hands the project a file that cannot be built
-//! (`docs/decisions/0015` in the veridoc repository). A file that already exists is refused unless
-//! `force` says otherwise, because a scaffold that overwrites an author's prose is worse than none.
+//! `init`: create the files only this plugin can create — the index `collect` reads, the prose file
+//! the requested document names, and the harness target the project's claim modules need. The host
+//! writes none of them, because a host that authors a file it cannot parse hands the project a file
+//! that cannot be built (`docs/decisions/0015` in the veridoc repository). A file that already exists
+//! is refused unless `force` says otherwise, because a scaffold that overwrites an author's prose is
+//! worse than none.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -10,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use plugin_rpc::{INVALID_REQUEST, PLUGIN_ERROR};
 use serde_json::{json, Value};
 
-use crate::project::{INDEX_FILE, INDEX_ITEM};
+use crate::project::{self, INDEX_FILE, INDEX_ITEM};
 
 /// The index file's text: the tree inside the one item the plugin reads. `init` writes this and
 /// `project::index_text` reads it back; the conformance emitter
@@ -19,10 +20,9 @@ use crate::project::{INDEX_FILE, INDEX_ITEM};
 pub fn index_body(tree: &str) -> String {
     format!(
         "// The document tree, created by `veridoc init` through the plugin. Edit it; do not \
-         regenerate it.\n\n/// The concepts and the documents this project declares, and the optional \
-         vocabulary. The plugin reads this item; `cargo` does not compile this file, because the index \
-         sits at the project root rather than under `src/`.\npub const {INDEX_ITEM}: &str = \
-         r##\"{tree}\"##;\n"
+         regenerate it.\n\n/// The concepts and the documents this project declares. The plugin reads \
+         this item; `cargo` does not compile this file, because the index sits at the project root \
+         rather than under `src/`.\npub const {INDEX_ITEM}: &str = r##\"{tree}\"##;\n"
     )
 }
 
@@ -103,6 +103,7 @@ pub fn init(params: &Value) -> Result<Value, (i64, String)> {
             format!("the document tree is not writable: {e}"),
         )
     })?);
+    let harness = harness_target(root);
     let files: Vec<(PathBuf, String)> = vec![
         (root.join(INDEX_FILE), index),
         (
@@ -114,10 +115,7 @@ pub fn init(params: &Value) -> Result<Value, (i64, String)> {
                  `src/<module>.doc.rs` claim module.\n"
             ),
         ),
-        (
-            root.join("examples").join("veridoc.rs"),
-            HARNESS_SCAFFOLD.to_string(),
-        ),
+        (harness.clone(), HARNESS_SCAFFOLD.to_string()),
     ];
 
     let mut written = Vec::new();
@@ -153,15 +151,34 @@ pub fn init(params: &Value) -> Result<Value, (i64, String)> {
         "written": written,
         "next": [
             format!(
-                "add `veridoc-claims = {{ version = \"{}\", ... }}` to the project's \
-                 [dev-dependencies], then declare the claims for one module in \
-                 src/<module>.doc.rs naming the concept {concept:?}, and add that module to \
-                 examples/veridoc.rs",
-                env!("CARGO_PKG_VERSION")
+                "add `veridoc-claims = {{ version = \"{}\", ... }}` to the [dev-dependencies] of \
+                 `{}`, then declare the claims for one module in src/<module>.doc.rs naming the \
+                 concept {concept:?}, and add that module to {}",
+                env!("CARGO_PKG_VERSION"),
+                project::relative(
+                    root,
+                    harness
+                        .parent()
+                        .and_then(|examples| examples.parent())
+                        .unwrap_or(root)
+                ),
+                project::relative(root, &harness),
             ),
             "run `veridoc check`",
         ],
     }))
+}
+
+/// The project's harness target. It has to sit in a Cargo package, because `cargo build --example
+/// veridoc` at a workspace root that only lists `members` answers "no example target named veridoc";
+/// the package chosen is the first one with a `src` directory, which is where the claim modules the
+/// target links live (`docs/decisions/0006:168-173`).
+fn harness_target(root: &Path) -> PathBuf {
+    let owner = project::packages(root)
+        .into_iter()
+        .find(|package| package.join(project::PACKAGE_SOURCE_DIR).is_dir())
+        .unwrap_or_else(|| root.to_path_buf());
+    owner.join("examples").join("veridoc.rs")
 }
 
 /// The project's own concept, from its directory name, so the first claim has a concept to name
@@ -185,5 +202,46 @@ fn concept_for(root: &Path) -> String {
         "project".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A virtual workspace owns no target, so the harness scaffold has to be written inside a member:
+    /// `cargo build --release --example veridoc` at the root answers "no example target named veridoc
+    /// in default-run packages", and `veridoc check` fails before the author has written a claim.
+    #[test]
+    fn the_harness_target_of_a_virtual_workspace_lands_in_the_member_package() {
+        let root = std::env::temp_dir().join(format!("veridoc-init-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/one/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/one\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/one/Cargo.toml"),
+            "[package]\nname = \"one\"\n",
+        )
+        .unwrap();
+        let answered = init(&json!({
+            "root": root,
+            "document": {
+                "path": "docs/architecture.spec.md",
+                "audience": "a developer writing a plugin",
+                "question": "What does the mechanism guarantee?"
+            },
+            "force": true,
+        }))
+        .expect("a project with no file on disk accepts init");
+        assert_eq!(
+            answered["written"][2], "crates/one/examples/veridoc.rs",
+            "the harness is written where a package can build it: {answered}"
+        );
+        assert!(root.join("crates/one/examples/veridoc.rs").is_file());
+        let _ = fs::remove_dir_all(&root);
     }
 }

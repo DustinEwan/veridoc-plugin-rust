@@ -165,10 +165,9 @@ fn tree() -> String {
 fn index_body(tree: &str) -> String {
     format!(
         "// The document tree, created by `veridoc init` through the plugin. Edit it; do not \
-         regenerate it.\n\n/// The concepts and the documents this project declares, and the optional \
-         vocabulary. The plugin reads this item; `cargo` does not compile this file, because the index \
-         sits at the project root rather than under `src/`.\npub const {INDEX_ITEM}: &str = \
-         r##\"{tree}\"##;\n"
+         regenerate it.\n\n/// The concepts and the documents this project declares. The plugin reads \
+         this item; `cargo` does not compile this file, because the index sits at the project root \
+         rather than under `src/`.\npub const {INDEX_ITEM}: &str = r##\"{tree}\"##;\n"
     )
 }
 
