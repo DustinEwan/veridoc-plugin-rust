@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/plugin-rust"]
+members = ["crates/plugin-rust", "crates/veridoc-claims"]
 # The example projects are separate crates: veridoc builds them, and the plugin must not be
 # rebuilt when an author builds their own project.
 exclude = ["examples/*"]

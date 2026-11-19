@@ -14,3 +14,8 @@ plugin-rpc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+
+# The claim-name rule lives in the library the project links, so the plugin reports a name and the
+# project's harness resolves that same name by one implementation (`claim_name` in
+# `crates/veridoc-claims/src/lib.rs`).
+veridoc-claims = { path = "../veridoc-claims" }

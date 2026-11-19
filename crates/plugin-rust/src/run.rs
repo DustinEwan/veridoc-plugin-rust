@@ -1,35 +1,36 @@
-//! `run`: executing one scenario through the project's own harness binary.
+//! `run` and `collect`'s claim list: talking to the project's own harness binary.
 //!
-//! Rust binds a call target at link time, so this plugin cannot do what the Node plugin does and
-//! `import()` the project's module inside its own process. The project instead ships a harness: a
-//! small binary that decodes the request with its own types, calls the action, and prints the
-//! declared observables as one JSON line. The plugin builds it once per connection, into
-//! `.veridoc/target` so a scenario build never invalidates the author's own incremental build, and
-//! spawns it per scenario. That keeps the plugin's failure surface finite -- the harness is
-//! missing, does not build, answers nothing, or answers badly -- instead of making the plugin
-//! compile generated glue against arbitrary Rust.
-//!
-//! The harness contract, in one line each way:
+//! Rust binds a call target at link time, so this plugin cannot do what a plugin for a hosted
+//! language does and load the project's module inside its own process. The project instead ships one
+//! harness target — `examples/veridoc.rs`, one call into the `veridoc-claims` library — which knows
+//! the claims of every claim module it links. The plugin builds it into `.veridoc/target` so a
+//! scenario build never invalidates the author's own incremental build, and asks it two questions
+//! (`docs/decisions/0006:57-74`):
 //!
 //! ```text
-//! stdin  {"scenarioId":"..","action":"..","args":[".."],"fixture":"<absolute dir>","deadlineMs":30000}
-//! stdout {"observables":{"exit_code":2},"satisfied":{"<predicate source>":true}}
+//! <harness> --list              {"libraryVersion":"0.1.0","claims":[{..},..]}
+//! <harness> --run <claim name>  {"values":{"exit_code":2},"satisfied":{"<predicate>":true}}
 //! ```
 //!
-//! `satisfied` is optional and keyed by the predicate text the author wrote. A harness that exits
+//! `--list` is what `collect` reports, so the claim set is whatever the compiled claim modules say it
+//! is rather than a copy of them in a data file. `--run` answers one claim by the name `--list`
+//! reported: the scenario has no identity of its own, so the claim is the address
+//! (`docs/decisions/0006:50-55`).
+//!
+//! The failure surface stays finite — the harness does not build, answers nothing, or answers badly —
+//! because the plugin never compiles generated glue against arbitrary Rust. A harness that exits
 //! non-zero but has already printed its answer is still believed, because a refusal inside the
-//! project's code is an observed value the assertion decides, not a run failure (`run.ts:2`).
-//! Only a harness that answers nothing is a failure, and the kind separates the four causes the
-//! profile names (`docs/schema/veridoc-1/run-failure-kind.json`).
+//! project's code is an observed value the assertion decides, not a run failure. Only a harness that
+//! answers nothing is a failure, and the kind separates the causes the profile names
+//! (`docs/schema/veridoc-1/run-failure-kind.json`).
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -38,32 +39,67 @@ use crate::project::{self, Project};
 /// Where the harness is built, kept out of the project's own `target/`.
 const HARNESS_TARGET_DIR: &str = ".veridoc/target";
 
+/// The harness target a Rust project ships: `examples/veridoc.rs`, built with the project's
+/// test-only dependencies available, which is what a claim module needs to call the project's code.
+/// Where the target sits is this plugin's convention rather than something the author restates
+/// (`docs/decisions/0006:168-173`).
+pub const HARNESS_EXAMPLE: &str = "veridoc";
+
 /// How much of the harness's stderr is quoted back. A compile error is in the last lines.
 const STDERR_TAIL: usize = 2000;
 
-/// The `params` of `run`, as the engine sends them (`run-request.json`).
+/// The time the plugin waits for `--list`. It is not a scenario deadline: it covers a build the
+/// author has already paid for plus one process start, and a project that takes longer than this to
+/// start is reported rather than waited on forever.
+const LIST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The `params` of `run`, as the engine sends them (`run-request.json`). The claim is addressed by
+/// name, because the scenario belongs to the claim.
 pub struct Request {
-    pub scenario_id: String,
-    pub fixture: String,
-    pub action: String,
-    pub args: Vec<String>,
-    pub deadline_ms: u64,
-    pub leaves: Vec<String>,
+    pub claim: String,
+    pub timeout_ms: u64,
 }
 
-/// What the harness answered.
+/// What the harness answered for one claim.
+#[derive(Debug)]
 struct Answers {
-    observables: HashMap<String, Value>,
+    values: HashMap<String, Value>,
     satisfied: HashMap<String, bool>,
 }
 
-/// The harness is built once per connection. The host starts one plugin process per run, so a
-/// second scenario in the same run pays only the spawn, and a build failure stays failed for the
-/// rest of the run because the author's fix needs a new process to take effect anyway.
+/// The harness is built once per connection. The host starts one plugin process per run, so a second
+/// claim in the same run pays only the spawn, and a build failure stays failed for the rest of the run
+/// because the author's fix needs a new process to take effect anyway.
 static HARNESS: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
+/// The claims the project's harness answers for, as `collect` needs them. A project whose claim
+/// modules do not compile stops collection with the compiler's own reason, which is the price
+/// `docs/decisions/0006:145` accepts for a sidecar that is executable code.
+pub fn listed_claims(root: &Path) -> Result<Vec<project::ListedClaim>, String> {
+    let binary = harness_binary(root)?;
+    let answered = spawn(&binary, root, &["--list".to_string()], LIST_TIMEOUT)
+        .map_err(|(_, detail)| detail)?;
+    let parsed: Value = serde_json::from_str(answered.trim())
+        .map_err(|e| format!("the harness answered --list with text that is not JSON: {e}"))?;
+    let library = parsed["libraryVersion"].as_str().unwrap_or_default();
+    if library != env!("CARGO_PKG_VERSION") {
+        return Err(format!(
+            "the project's harness was built against veridoc-claims {library}, which this plugin \
+             (version {}) does not speak; update the project's dev-dependency",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    let claims = parsed["claims"]
+        .as_array()
+        .ok_or_else(|| "the harness answered --list without a claims array".to_string())?;
+    serde_json::from_value(Value::Array(claims.clone())).map_err(|e| {
+        format!("the harness answered --list with a claim this plugin cannot read: {e}")
+    })
+}
+
 /// Answer one `run`. Every path returns the response shape: a run failure is a normal answer,
-/// because the engine turns it into a red run and the reason the author reads.
+/// because the engine turns it into one claim's red run and the reason the author reads, while every
+/// other claim keeps its verdict (`docs/decisions/0006:100-106`).
 pub fn run(project: &Project, request: &Request) -> Value {
     match execute(project, request) {
         Ok(answer) => answer,
@@ -77,107 +113,63 @@ pub fn run(project: &Project, request: &Request) -> Value {
 }
 
 fn execute(project: &Project, request: &Request) -> Result<Value, (&'static str, String)> {
-    let action = project
-        .tree
-        .actions
-        .iter()
-        .find(|declared| declared.name == request.action)
-        .ok_or_else(|| {
-            (
-                "plugin",
-                format!(
-                    "no action named {:?} is declared in {}",
-                    request.action,
-                    project::TREE_FILE
-                ),
-            )
-        })?;
-    if !project.tree.fixtures.iter().any(|f| f == &request.fixture) {
-        return Err((
-            "fixture",
-            format!(
-                "no fixture named {:?} is declared in {}",
-                request.fixture,
-                project::TREE_FILE
-            ),
-        ));
-    }
-    let fixture = project.root.join(&request.fixture);
-    if !fixture.is_dir() {
-        return Err((
-            "fixture",
-            format!("the fixture directory {} does not exist", fixture.display()),
-        ));
-    }
-    let harness = project.tree.harness.as_deref().ok_or_else(|| {
+    let owner = project.claim(&request.claim).ok_or_else(|| {
+        (
+            "plugin",
+            format!("this project declares no claim named {}", request.claim),
+        )
+    })?;
+    let scenario = project.scenario(&request.claim).ok_or_else(|| {
+        (
+            "plugin",
+            format!("claim {} declares no scenario", request.claim),
+        )
+    })?;
+    let tree = owner.channel.asserts.as_ref().ok_or_else(|| {
         (
             "plugin",
             format!(
-                "{} declares no harness, so the plugin cannot execute a scenario; add \
-                 \"harness\": \"<bin name>\" and a src/bin/<bin name>.rs",
-                project::TREE_FILE
+                "claim {} declares no assertion tree to answer from",
+                request.claim
             ),
         )
     })?;
-    let binary = harness_binary(&project.root, harness)?;
-    let answers = spawn(&binary, request, &fixture)?;
+    let binary = harness_binary(&project.root).map_err(|reason| ("build", reason))?;
+    let answered = spawn(
+        &binary,
+        &project.root,
+        &["--run".to_string(), request.claim.clone()],
+        Duration::from_millis(request.timeout_ms.max(1)),
+    )?;
+    let answers = read_answers(&answered, &harness_name(&binary))?;
 
+    // The engine decides `equals` and `contains` itself from the observed values (`evaluate` in
+    // `crates/veridoc-engine/src/execute.rs`); only a `satisfies` leaf needs the plugin's answer.
     let mut observed = Vec::new();
-    for declared in &project.tree.observables {
-        match answers.observables.get(&declared.name) {
+    for declared in &scenario.values {
+        match answers.values.get(&declared.name) {
             Some(value) => observed.push(json!({
                 "observable": declared.name,
                 "value": value.to_string(),
             })),
-            None if action.produces.contains(&declared.name) => {
+            None => {
                 return Err((
                     "plugin",
                     format!(
-                        "the harness {harness} answered no value for {}, which action {} declares \
-                         it produces",
-                        declared.name, action.name
+                        "the harness {} answered no value for {}, which claim {} declares it \
+                         returns",
+                        harness_name(&binary),
+                        declared.name,
+                        request.claim
                     ),
                 ))
             }
-            None => observed.push(json!({
-                "observable": declared.name,
-                "value": "null",
-            })),
         }
     }
 
     let mut satisfied = Vec::new();
-    for leaf_id in &request.leaves {
-        let (claim_part, index) = split_leaf(leaf_id);
-        let owner = project
-            .scenario(&request.scenario_id)
-            .into_iter()
-            .find(|claim| project.claim_name(claim) == claim_part)
-            .ok_or_else(|| {
-                (
-                    "plugin",
-                    format!(
-                        "leaf {leaf_id} names claim {claim_part}, which declares no scenario \
-                         {:?} in this project",
-                        request.scenario_id
-                    ),
-                )
-            })?;
-        let tree = owner.channel.asserts.as_ref().ok_or_else(|| {
-            (
-                "plugin",
-                format!("claim {claim_part} declares no assertion tree to answer from"),
-            )
-        })?;
-        let Some(check) = leaves(tree).into_iter().nth(index) else {
-            return Err((
-                "plugin",
-                format!("leaf {leaf_id} is past the end of claim {claim_part}'s assertion tree"),
-            ));
-        };
-        // The engine decides `equals` and `contains` itself from the observed values
-        // (`evaluate` in `crates/veridoc-engine/src/execute.rs`); only a `satisfies` leaf needs the
-        // plugin's answer.
+    for (index, check) in leaves(tree).into_iter().enumerate() {
+        let leaf_id = format!("{}#l{index}", request.claim);
         let Some(spec) = check.get("satisfies") else {
             satisfied.push(json!({ "leafId": leaf_id, "ok": true }));
             continue;
@@ -191,7 +183,11 @@ fn execute(project: &Project, request: &Request) -> Result<Value, (&'static str,
             None => {
                 return Err((
                     "plugin",
-                    format!("the harness {harness} implements no predicate {source:?}"),
+                    format!(
+                        "the harness {} answers no predicate {source:?} for claim {}",
+                        harness_name(&binary),
+                        request.claim
+                    ),
                 ))
             }
         }
@@ -200,191 +196,213 @@ fn execute(project: &Project, request: &Request) -> Result<Value, (&'static str,
     Ok(json!({ "ok": true, "observed": observed, "satisfied": satisfied }))
 }
 
-/// Build the harness, or return the reason it cannot be built. The kind is `build` for every
-/// failure here, including a missing `Cargo.toml`, because the cause is always the project's
-/// build and the detail quotes cargo.
-fn harness_binary(root: &Path, harness: &str) -> Result<PathBuf, (&'static str, String)> {
-    HARNESS
-        .get_or_init(|| {
-            let target = root.join(HARNESS_TARGET_DIR);
-            let output = Command::new("cargo")
-                .arg("build")
-                .arg("--release")
-                .arg("--manifest-path")
-                .arg(root.join("Cargo.toml"))
-                .arg("--bin")
-                .arg(harness)
-                .arg("--target-dir")
-                .arg(&target)
-                .output()
-                .map_err(|e| format!("cargo could not be started to build {harness}: {e}"))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "the harness {harness} does not build: {}",
-                    tail(&output.stderr)
-                ));
-            }
-            let binary = target.join("release").join(harness);
-            if !binary.is_file() {
-                return Err(format!(
-                    "cargo reported success but {} is not there",
-                    binary.display()
-                ));
-            }
-            Ok(binary)
-        })
-        .clone()
-        .map_err(|detail| ("build", detail))
+/// The harness answer for one claim: the declared values, and the predicate answers when the claim's
+/// assertion tree asks the plugin to settle one. A harness that prints `{"error":..}` and exits
+/// non-zero has run the scenario and been refused by the project's own code path, which is a run
+/// failure naming the claim rather than a verdict.
+fn read_answers(answered: &str, harness: &str) -> Result<Answers, (&'static str, String)> {
+    let parsed: Value = serde_json::from_str(answered.trim()).map_err(|_| {
+        (
+            "plugin",
+            format!("the harness {harness} answered a scenario with text that is not JSON"),
+        )
+    })?;
+    if let Some(error) = parsed.get("error").and_then(Value::as_str) {
+        return Err(("plugin", error.to_string()));
+    }
+    let values = match parsed.get("values") {
+        Some(Value::Object(entries)) => entries
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        _ => {
+            return Err((
+                "plugin",
+                format!("the harness {harness} answered a scenario with no values object"),
+            ))
+        }
+    };
+    let satisfied = match parsed.get("satisfied") {
+        Some(Value::Object(entries)) => entries
+            .iter()
+            .filter_map(|(name, value)| value.as_bool().map(|ok| (name.clone(), ok)))
+            .collect(),
+        _ => HashMap::new(),
+    };
+    Ok(Answers { values, satisfied })
 }
 
-/// Run the harness under the scenario's deadline. The deadline covers the scenario, not the build:
-/// a cold build of a real crate is longer than any scenario deadline, which is why the build is
-/// done once and outside it.
+/// Build the project's harness target, or return the reason it cannot be built. The reason is a
+/// `build` failure for every cause here, including a missing `Cargo.toml`, because the cause is
+/// always the project's build and the detail quotes cargo.
+fn harness_binary(root: &Path) -> Result<PathBuf, String> {
+    HARNESS.get_or_init(|| build_harness(root)).clone()
+}
+
+fn build_harness(root: &Path) -> Result<PathBuf, String> {
+    if !root.join("Cargo.toml").is_file() {
+        return Err(format!(
+            "{} holds no Cargo.toml, so the plugin cannot build the project's claim modules",
+            root.display()
+        ));
+    }
+    let example = root.join("examples").join(format!("{HARNESS_EXAMPLE}.rs"));
+    if !example.is_file() {
+        return Err(format!(
+            "the project ships no {}, so the plugin cannot ask it what its claim modules declare; \
+             the harness is one call into the veridoc-claims library",
+            project::relative(root, &example)
+        ));
+    }
+    let built = Command::new("cargo")
+        .arg("build")
+        .arg("--release")
+        .arg("--offline")
+        .arg("--example")
+        .arg(HARNESS_EXAMPLE)
+        .arg("--target-dir")
+        .arg(HARNESS_TARGET_DIR)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    let output = match built {
+        Ok(output) => output,
+        Err(e) => {
+            return Err(format!(
+                "cargo could not be started to build the project's claim modules: {e}"
+            ))
+        }
+    };
+    if !output.status.success() {
+        return Err(format!(
+            "the project's claim modules do not build: {}",
+            tail(&output.stderr)
+        ));
+    }
+    let binary = root
+        .join(HARNESS_TARGET_DIR)
+        .join("release")
+        .join("examples")
+        .join(HARNESS_EXAMPLE);
+    if !binary.is_file() {
+        return Err(format!(
+            "cargo built the {} example but left no {} where the plugin looks for it",
+            HARNESS_EXAMPLE,
+            project::relative(root, &binary)
+        ));
+    }
+    Ok(binary)
+}
+
+/// Run the harness under a deadline, from the project root, so a scenario that opens an asset of the
+/// project finds it by the path the author wrote. The deadline covers the scenario, not the build: a
+/// cold build of a real crate is longer than any scenario deadline, which is why the build is done
+/// once and outside it.
 fn spawn(
     binary: &Path,
-    request: &Request,
-    fixture: &Path,
-) -> Result<Answers, (&'static str, String)> {
+    root: &Path,
+    args: &[String],
+    deadline: Duration,
+) -> Result<String, (&'static str, String)> {
     let mut child = Command::new(binary)
-        .arg(fixture)
-        .stdin(Stdio::piped())
+        .args(args)
+        .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
             (
                 "plugin",
-                format!("the harness {} could not be started: {e}", binary.display()),
-            )
-        })?;
-    let payload = json!({
-        "scenarioId": request.scenario_id,
-        "action": request.action,
-        "args": request.args,
-        "fixture": fixture,
-        "deadlineMs": request.deadline_ms,
-    });
-    let mut stdin = child.stdin.take().ok_or((
-        "plugin",
-        "the harness has no stdin to write the request to".to_string(),
-    ))?;
-    stdin
-        .write_all(payload.to_string().as_bytes())
-        .map_err(|e| {
-            (
-                "plugin",
-                format!("the harness request could not be written: {e}"),
-            )
-        })?;
-    drop(stdin);
-
-    let mut stdout = child.stdout.take().ok_or((
-        "plugin",
-        "the harness has no stdout to read the answer from".to_string(),
-    ))?;
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stdout.read_to_end(&mut bytes);
-        let _ = sender.send(bytes);
-    });
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or(("plugin", "the harness has no stderr".to_string()))?;
-    let collected = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&collected);
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr.read_to_end(&mut bytes);
-        if let Ok(mut held) = sink.lock() {
-            *held = bytes;
-        }
-    });
-
-    let waited = Duration::from_millis(request.deadline_ms.max(1));
-    let output = match receiver.recv_timeout(waited) {
-        Ok(output) => output,
-        Err(_) => {
-            // Killing the child rather than the plugin is the point of running the scenario out
-            // of process: the deadline is a run failure the engine reports, not a lost plugin.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err((
-                "deadline",
                 format!(
-                    "the harness answered nothing within {} ms",
-                    request.deadline_ms
+                    "the harness {} could not be started: {e}",
+                    harness_name(binary)
                 ),
-            ));
-        }
+            )
+        })?;
+    let mut stdout = child.stdout.take().expect("the harness's stdout is piped");
+    let mut stderr = child.stderr.take().expect("the harness's stderr is piped");
+    let collected = Arc::new(Mutex::new(String::new()));
+    let err_collected = Arc::clone(&collected);
+    let reader = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        *err_collected
+            .lock()
+            .expect("the harness reader is the only holder") = text;
+    });
+    let err_sink = Arc::new(Mutex::new(Vec::new()));
+    let err_reader = {
+        let sink = Arc::clone(&err_sink);
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            *sink
+                .lock()
+                .expect("the harness error reader is the only holder") = bytes;
+        })
     };
-    let status = child
-        .wait()
-        .map_err(|e| ("plugin", format!("waiting for the harness failed: {e}")))?;
-    let stderr = collected
-        .lock()
-        .map(|bytes| tail(&bytes))
-        .unwrap_or_else(|_| String::from("its stderr could not be read"));
 
-    let answer = String::from_utf8_lossy(&output)
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default()
-        .to_string();
-    if answer.is_empty() {
+    // Poll rather than block on a thread: the deadline has to be able to kill the harness, and a
+    // thread that owns `child` in order to wait on it cannot hand it back to be killed.
+    let until = Instant::now() + deadline;
+    let mut status = None;
+    while Instant::now() < until {
+        match child.try_wait() {
+            Ok(Some(exit)) => {
+                status = Some(exit);
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(e) => {
+                return Err((
+                    "plugin",
+                    format!(
+                        "the harness {} could not be waited on: {e}",
+                        harness_name(binary)
+                    ),
+                ))
+            }
+        }
+    }
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        let _ = err_reader.join();
         return Err((
-            "plugin",
-            if status.success() {
-                format!(
-                    "the harness {harness} answered no JSON line",
-                    harness = harness_name(binary)
-                )
-            } else {
-                format!(
-                    "the harness {harness} exited {status} without answering: {stderr}",
-                    harness = harness_name(binary)
-                )
-            },
+            "deadline",
+            format!(
+                "the scenario outlived its {} ms deadline",
+                deadline.as_millis()
+            ),
         ));
     }
-    let value: Value = serde_json::from_str(&answer)
-        .map_err(|e| ("plugin", format!("the harness answer is not JSON: {e}")))?;
-    Ok(Answers {
-        observables: value
-            .get("observables")
-            .and_then(Value::as_object)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        satisfied: value
-            .get("satisfied")
-            .and_then(Value::as_object)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .map(|(name, value)| {
-                        (
-                            name.clone(),
-                            value
-                                .as_bool()
-                                .unwrap_or_else(|| value.as_str() == Some("true")),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-    })
+    let _ = reader.join();
+    let _ = err_reader.join();
+    let answered = Arc::try_unwrap(collected)
+        .expect("the harness readers have been joined")
+        .into_inner()
+        .expect("the harness answer was never poisoned");
+    if answered.trim().is_empty() {
+        let bytes = Arc::try_unwrap(err_sink)
+            .expect("the harness error reader has been joined")
+            .into_inner()
+            .expect("the harness error was never poisoned");
+        return Err((
+            "plugin",
+            format!(
+                "the harness {} answered nothing: {}",
+                harness_name(binary),
+                String::from_utf8_lossy(&bytes)
+            ),
+        ));
+    }
+    Ok(answered)
 }
 
 /// The assertion tree's leaves in preorder, each as its `is` object, which is the order the engine
-/// numbers them in (`evaluate` in `crates/veridoc-engine/src/execute.rs`, and `run.ts:26-33` for the
-/// same walk).
+/// numbers them in (`evaluate` in `crates/veridoc-engine/src/execute.rs`).
 pub fn leaves(tree: &Value) -> Vec<&Value> {
     let mut found = Vec::new();
     walk(tree, &mut found);
@@ -404,8 +422,8 @@ fn walk<'a>(node: &'a Value, found: &mut Vec<&'a Value>) {
         }
         return;
     }
-    if let Some(inner) = node.get("not") {
-        walk(inner, found);
+    if let Some(child) = node.get("not") {
+        walk(child, found);
         return;
     }
     if let Some(check) = node.get("is") {
@@ -413,73 +431,77 @@ fn walk<'a>(node: &'a Value, found: &mut Vec<&'a Value>) {
     }
 }
 
-/// `<claim name>#l<n>` into its two parts, split at the last `#l` because a claim name carries a
-/// `#` of its own. A leaf id with no marker is treated as leaf 0 of the whole id, which is what the
-/// engine sends when a claim has one leaf.
-fn split_leaf(leaf_id: &str) -> (&str, usize) {
-    match leaf_id.rsplit_once("#l") {
-        Some((claim, index)) => (claim, index.parse().unwrap_or(0)),
-        None => (leaf_id, 0),
-    }
-}
-
 fn harness_name(binary: &Path) -> String {
     binary
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("the harness")
+        .and_then(|n| n.to_str())
+        .unwrap_or("harness")
         .to_string()
 }
 
 /// The last bytes of the harness's stderr, which is where cargo puts the reason.
 fn tail(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
-    let trimmed = text.trim();
-    if trimmed.len() <= STDERR_TAIL {
-        return trimmed.to_string();
+    if text.len() <= STDERR_TAIL {
+        return text.trim().to_string();
     }
-    let start = trimmed.len() - STDERR_TAIL;
-    let start = trimmed
+    let cut = text.len() - STDERR_TAIL;
+    let start = text[cut..]
         .char_indices()
-        .take_while(|(index, _)| *index <= start)
-        .map(|(index, _)| index)
-        .last()
-        .unwrap_or(0);
-    format!("...{}", &trimmed[start..])
+        .next()
+        .map(|(at, _)| cut + at)
+        .unwrap_or(cut);
+    format!("..{}", text[start..].trim())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{leaves, split_leaf};
-    use serde_json::json;
+    use super::*;
 
     #[test]
-    fn leaves_are_numbered_in_preorder() {
-        // The engine numbers leaves by walking `all`, then `any`, then `not`, then the leaf
-        // itself (`evaluate` in `crates/veridoc-engine/src/execute.rs`). A different order answers
-        // the wrong leaf.
-        let tree = json!({ "all": [
-            { "obs": "exit_code", "is": { "equals": 2 } },
-            { "any": [
-                { "obs": "message", "is": { "contains": "config.json" } },
-                { "not": { "obs": "exit_code", "is": { "equals": 0 } } },
-            ] },
-        ] });
-        let checks = leaves(&tree);
-        assert_eq!(checks.len(), 3, "{checks:?}");
-        assert_eq!(checks[1], &json!({ "contains": "config.json" }));
-        assert_eq!(checks[2], &json!({ "equals": 0 }));
+    fn the_leaves_are_numbered_in_the_order_the_engine_numbers_them() {
+        let tree = json!({
+            "all": [
+                { "obs": "exit_code", "is": { "equals": 2 } },
+                { "not": { "obs": "stderr", "is": { "contains": "panic" } } },
+                { "any": [
+                    { "obs": "stderr", "is": { "satisfies": { "source": "names the directory" } } }
+                ] }
+            ]
+        });
+        let found = leaves(&tree);
+        assert_eq!(found.len(), 3);
+        assert!(found[0].get("equals").is_some());
+        assert!(found[1].get("contains").is_some());
+        assert!(found[2]
+            .get("satisfies")
+            .and_then(|s| s.get("source"))
+            .is_some());
     }
 
     #[test]
-    fn a_leaf_id_splits_into_its_claim_and_its_index() {
-        assert_eq!(
-            split_leaf("probe#rejects-missing-project-root#l2"),
-            ("probe#rejects-missing-project-root", 2)
-        );
-        assert_eq!(
-            split_leaf("probe#rejects-missing-project-root"),
-            ("probe#rejects-missing-project-root", 0)
-        );
+    fn a_harness_answer_of_values_is_believed_even_when_the_project_refused() {
+        let answers = read_answers(
+            "{\"values\":{\"exit_code\":2},\"satisfied\":{\"names the directory\":true}}",
+            "veridoc",
+        )
+        .unwrap();
+        assert_eq!(answers.values.get("exit_code").unwrap(), &json!(2));
+        assert!(answers.satisfied.get("names the directory").unwrap());
+    }
+
+    #[test]
+    fn a_harness_that_reports_an_error_is_one_claims_run_failure() {
+        let (kind, detail) =
+            read_answers("{\"error\":\"probe refused: no config.json\"}", "veridoc").unwrap_err();
+        assert_eq!(kind, "plugin");
+        assert!(detail.contains("refused"), "{detail}");
+    }
+
+    #[test]
+    fn a_harness_that_answers_no_values_is_a_failure_not_an_empty_run() {
+        let (kind, detail) = read_answers("{\"satisfied\":{}}", "veridoc").unwrap_err();
+        assert_eq!(kind, "plugin");
+        assert!(detail.contains("no values object"), "{detail}");
     }
 }

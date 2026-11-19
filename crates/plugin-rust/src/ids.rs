@@ -42,45 +42,20 @@ pub fn claim_identity(subject: &str, predicate: &str) -> String {
     format!("c{}", &joined(subject, predicate)[..16])
 }
 
-/// A claim's name, `<subject>#<slug>`, recomputed exactly as the engine computes it. Two claims of
-/// one project can slug alike, and bind then adds `suffix(claim_identity(..))` to every one of
-/// them; that pass belongs to the whole claim set, so it lives in `project::Project::claim_name`,
-/// not here.
+/// A claim's name, `<subject>#<slug>`, as the engine computes it. The rule itself lives in
+/// `veridoc-claims`, the library the project's claim modules link, because the project's harness
+/// resolves the name it is handed by that one implementation: a second copy here could report a
+/// name the harness cannot find. Two claims of one project can slug alike, and bind then adds
+/// `suffix(claim_identity(..))` to every one of them; that pass belongs to the whole claim set, so
+/// it lives in `project::Project::claim_name`, not here.
 pub fn claim_name(subject: &str, predicate: &str) -> String {
-    format!("{}#{}", subject, slug(predicate, MAX_SLUG))
+    veridoc_claims::claim_name(subject, predicate)
 }
 
 /// The identity shortened for use as a collision suffix, so two claims that slug alike stay
 /// distinguishable without reprinting the whole digest.
 pub fn suffix(identity: &str) -> String {
     format!("~{}", &identity[1..7])
-}
-
-/// The longest predicate slug a name carries before it is cut at a word boundary.
-const MAX_SLUG: usize = 48;
-
-/// Lower-case, alphanumeric runs joined by `-`, cut at the last whole word that fits in `max`. A
-/// cut name is a prefix of the uncut one, so a claim keeps the prefix a reader may already have
-/// copied even when a longer word pushes the tail off. The length is counted in bytes, as the
-/// engine counts it, so the two cut the same predicate at the same word.
-fn slug(text: &str, max: usize) -> String {
-    let lowered = text.to_lowercase();
-    let mut words: Vec<&str> = Vec::new();
-    for word in lowered
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-    {
-        let length = if words.is_empty() {
-            word.len()
-        } else {
-            words.iter().map(|w| w.len() + 1).sum::<usize>() + word.len()
-        };
-        if length > max {
-            break;
-        }
-        words.push(word);
-    }
-    words.join("-")
 }
 
 fn hashed(prefix: &str, discriminator: &str, name: &str) -> String {

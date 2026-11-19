@@ -1,0 +1,10 @@
+[package]
+name = "veridoc-claims"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "The claim library a Rust project adds as a dev-dependency: the claim and its scenario, and the harness runtime that answers --list and --run."
+
+# No dependencies, on purpose: the plugin builds this crate inside the author's project, where a
+# dependency download would make a documentation check depend on the network and the clock.
+[dependencies]

@@ -39,12 +39,9 @@ pub struct DerivableResult {
 /// declares answers no facts, which is the answer the host reads as "nothing here is redundant":
 /// inventing a fact would reject a claim about code this plugin has not seen.
 pub fn facts(root: &Path, referent: &str) -> DerivableResult {
-    if let Some(name) = declared_concept(root, referent) {
+    if let Some((name, document)) = declared_concept(root, referent) {
         return DerivableResult {
-            facts: vec![format!(
-                "concept {name} is declared in {}.",
-                project::TREE_FILE
-            )],
+            facts: vec![format!("concept {name} is declared in {document}.")],
         };
     }
     match declaration_of(root, referent) {
@@ -55,11 +52,11 @@ pub fn facts(root: &Path, referent: &str) -> DerivableResult {
     }
 }
 
-/// The concept whose identity is `referent`, when the project declares one.
-fn declared_concept(root: &Path, referent: &str) -> Option<String> {
-    project::concepts(root)
+/// The concept whose identity is `referent`, with the document that declares it.
+fn declared_concept(root: &Path, referent: &str) -> Option<(String, String)> {
+    project::concept_declarations(root)
         .into_iter()
-        .find(|name| concept_id(name) == referent)
+        .find(|(name, _)| concept_id(name) == referent)
 }
 
 /// The declaration an id names, with the project-relative path it was hashed from.
@@ -252,18 +249,23 @@ pub fn guard(dir: &Path) -> Config {
     }
 
     #[test]
-    fn a_concept_answers_the_file_that_declares_it() {
+    fn a_concept_answers_the_document_that_declares_it() {
         let root = project(
             "concept",
             &[
                 ("src/config.rs", CONFIG_RS),
-                ("veridoc.tree.json", r#"{ "concepts": ["project-scan"] }"#),
+                (
+                    crate::project::INDEX_FILE,
+                    &crate::init::index_body(
+                        r#"{ "concepts": { "project-scan": "docs/spec.md" }, "documents": [] }"#,
+                    ),
+                ),
             ],
         );
         let answer = facts(&root, &concept_id("project-scan"));
         assert_eq!(
             answer.facts,
-            vec!["concept project-scan is declared in veridoc.tree.json.".to_string()]
+            vec!["concept project-scan is declared in docs/spec.md.".to_string()]
         );
         let _ = fs::remove_dir_all(&root);
     }

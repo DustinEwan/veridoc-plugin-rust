@@ -11,12 +11,11 @@
 //! Three choices are specific to Rust and are the reason this file is not a translation of
 //! the Node plugin's emitter:
 //!
-//! - The fixture's `Cargo.toml` has no dependencies. The plugin builds the fixture's harness with
-//!   `cargo build --release` inside the suite's `run` deadline (`harness_binary` in `run.rs`), so
-//!   a dependency download would make conformance depend on the network and the clock. The
-//!   rendered harness therefore reads its two request fields with
-//!   `std` alone, which a real project has no reason to do — it already has its own argument
-//!   types in scope.
+//! - The fixture's only dependency is the plugin's own claim library, reached by path. The plugin
+//!   builds the fixture's harness with `cargo build --release --example veridoc` inside the suite's
+//!   `run` deadline (`harness_binary` in `run.rs`), so a registry download would make conformance
+//!   depend on the network and the clock. The claim library depends on `std` alone, which is what
+//!   keeps that path dependency enough.
 //! - The four bivalence negatives are this plugin's own structural negatives. The `bivalence`
 //!   answer in `bivalence.rs` is `false` for a claim with no leaf and for a claim whose tree
 //!   contains a `satisfies` leaf, because the plugin does not evaluate Rust predicates; the Node
@@ -37,14 +36,19 @@ use sha2::{Digest, Sha256};
 const SUBJECT: &str = "probe";
 /// The concept the fixture declares; a claim with no `symbol` is about this.
 const CONCEPT: &str = "probe-scan";
-/// The scenario the suite runs.
-const SCENARIO: &str = "probe/refuses-missing-root";
-/// The action the suite asks for, and the harness's one implemented branch.
-const ACTION: &str = "run-probe";
-/// The fixture directory the scenario runs against: it holds no `config.json`.
+/// The directory a scenario runs against: it holds no `config.json`. It is a project asset the
+/// scenario opens by path, not a declared fixture (`docs/decisions/0006:47-48`).
 const FIXTURE: &str = "fixtures/empty-directory";
-/// The harness binary the rendered project ships.
-const HARNESS: &str = "veridoc-harness";
+/// The fixture's claim module: the claims about `src/probe.rs` and the scenarios they carry.
+const CLAIM_MODULE: &str = "src/probe.doc.rs";
+/// The fixture's harness target: one call into the claim library. Where the target sits is this
+/// plugin's convention (`HARNESS_EXAMPLE` in `run.rs`), so the emitter renders it there.
+const HARNESS_TARGET: &str = "examples/veridoc.rs";
+/// The index file the plugin reads, and the item inside it. These mirror `INDEX_FILE` and
+/// `INDEX_ITEM` in `crates/plugin-rust/src/project.rs`, and `index_body` mirrors `init::index_body`:
+/// this program renders a project without linking the plugin crate.
+const INDEX_FILE: &str = "index.doc.rs";
+const INDEX_ITEM: &str = "VERIDOC_INDEX";
 
 /// The citation store the manifest names, the log that answers it, and the turn the suite asks
 /// for. A `file` store is a directory of `<id>.jsonl` logs read against the project root.
@@ -72,15 +76,22 @@ fn config() -> String {
     )
 }
 
-const CARGO_TOML: &str = r#"[package]
+/// The fixture's manifest. Its one dependency is the plugin's claim library, by path, so building
+/// the fixture's harness needs no registry.
+fn cargo_toml(claims_crate: &str) -> String {
+    format!(
+        r#"[package]
 name = "veridoc-conformance-fixture"
 version = "0.1.0"
 edition = "2021"
 
-# No dependencies, on purpose: the plugin builds this harness inside the suite's `run` deadline,
-# so the harness decodes its request with `std` instead of pulling a JSON crate onto the clock.
+[dev-dependencies]
+veridoc-claims = {{ path = "{claims_crate}" }}
+
 [workspace]
-"#;
+"#
+    )
+}
 
 const LIB_RS: &str = r#"//! The fixture's library: one module, so `collect` has one file to walk.
 
@@ -119,205 +130,30 @@ fn config_of(dir: &Path) -> PathBuf {
 }
 "#;
 
-/// The rendered harness. It answers the two observables the vocabulary declares and nothing else:
-/// the scenario claim's tree holds only `equals` and `contains` leaves, which the plugin answers
-/// from the observed values itself, so no `satisfied` entry is asked for. The suite's
-/// `run-returns-values` rule compiles and runs this text; no unit test here does, because
-/// compiling it means building the whole fixture.
-const HARNESS_RS: &str = r#"//! The fixture's scenario harness. Contract, one line each way:
-//!
-//! ```text
-//! stdin  {"scenarioId":"..","action":"..","args":[],"fixture":"<absolute dir>","deadlineMs":..}
-//! stdout {"observables":{"exit_code":2,"message":".."}}
-//! ```
+/// The fixture's harness: the claims of every claim module it links, in one call into the claim
+/// library (`docs/decisions/0006:67-74`). The plugin builds this target and asks it `--list` and
+/// `--run <claim name>`; the fixture never runs it by hand.
+const HARNESS_RS: &str = r#"//! The fixture's harness: one call into the claim library.
 
-use std::io::Read;
+#[path = "../src/probe.doc.rs"]
+mod probe_doc;
 
-use veridoc_conformance_fixture::probe;
-
-fn main() {
-    let mut request = String::new();
-    if std::io::stdin().read_to_string(&mut request).is_err() {
-        eprintln!("the harness has no stdin to read the request from");
-        std::process::exit(127);
-    }
-    let action = string_field(&request, "action").unwrap_or_default();
-    let fixture = string_field(&request, "fixture")
-        .or_else(|| std::env::args().nth(1))
-        .unwrap_or_default();
-    if action != "run-probe" {
-        eprintln!("the harness implements no action {action:?}");
-        std::process::exit(127);
-    }
-    let (code, message) = match probe(std::path::Path::new(&fixture)) {
-        Ok(_) => (0, String::new()),
-        Err(reason) => (2, reason),
-    };
-    println!(
-        "{{\"observables\":{{\"exit_code\":{code},\"message\":{}}}}}",
-        quote(&message)
-    );
-}
-
-/// The unescaped value of one top-level string field of the request line. The fixture keeps the
-/// request flat, so the first occurrence of `"key":"` is the field.
-fn string_field(text: &str, key: &str) -> Option<String> {
-    let marker = format!("\"{key}\":\"");
-    let rest = text.find(&marker)? + marker.len();
-    let bytes = text.as_bytes();
-    let mut value = String::new();
-    let mut at = rest;
-    while at < bytes.len() {
-        match bytes[at] {
-            b'\\' if at + 1 < bytes.len() => {
-                match bytes[at + 1] {
-                    b'n' => value.push('\n'),
-                    b't' => value.push('\t'),
-                    b'r' => value.push('\r'),
-                    b'"' => value.push('"'),
-                    b'\\' => value.push('\\'),
-                    b'/' => value.push('/'),
-                    other => value.push(other as char),
-                }
-                at += 2;
-            }
-            b'"' => return Some(value),
-            other => value.push(other as char),
-        }
-        at += 1;
-    }
-    None
-}
-
-/// A JSON string literal for `text`.
-fn quote(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other => out.push(other),
-        }
-    }
-    out.push('"');
-    out
+fn main() -> std::process::ExitCode {
+    veridoc_claims::harness(veridoc_claims::merge([probe_doc::claims()]))
 }
 "#;
 
-/// The vocabulary file: the concept, the document node, the two observables, the action, the one
-/// fixture, and the harness `run` builds.
+/// The tree the index declares: the concept and the document node, and nothing else
+/// (`docs/decisions/0001`, `0006:83`).
 fn tree() -> String {
     format!(
         r#"{{
-  "concepts": ["{CONCEPT}"],
+  "concepts": {{ "{CONCEPT}": "docs/architecture.spec.md" }},
   "documents": [
     {{
       "path": "docs/architecture.spec.md",
       "audience": "the reader of a conformance report",
       "question": "What does this plugin answer for a Rust project?"
-    }}
-  ],
-  "observables": [
-    {{ "name": "exit_code", "type": "number" }},
-    {{ "name": "message", "type": "string" }}
-  ],
-  "actions": [
-    {{
-      "name": "{ACTION}",
-      "calls": {{ "kind": "symbol", "name": "{SUBJECT}", "from": "src/probe.rs" }},
-      "produces": ["exit_code", "message"]
-    }}
-  ],
-  "fixtures": ["{FIXTURE}"],
-  "harness": "{HARNESS}"
-}}
-"#
-    )
-}
-
-/// The artefact the `no-assertion-tree` witness points at. Its hash is computed as the fixture is
-/// rendered, so the claim cannot drift from the file beside it.
-const EVIDENCE: &str = "probe refused fixtures/empty-directory: holds no config.json\n";
-
-/// The claims: the scenario claim the suite runs, the four structural negatives, and the one
-/// positive probe. Every predicate named in `veridoc-conformance.json` is declared here, because
-/// the suite looks each one up in the `collect` answer by predicate.
-fn claims(artefact_hash: &str) -> String {
-    format!(
-        r#"{{
-  "claims": [
-    {{
-      "kind": "ensures",
-      "symbol": "{SUBJECT}",
-      "concept": "{CONCEPT}",
-      "predicate": "refuses-missing-config",
-      "text": "probe refuses a directory that holds no config.json: the run exits 2 and the message names the file.",
-      "channel": {{
-        "scenario": "{SCENARIO}",
-        "asserts": {{
-          "all": [
-            {{ "obs": "exit_code", "is": {{ "equals": 2 }} }},
-            {{ "obs": "message", "is": {{ "contains": "config.json" }} }}
-          ]
-        }}
-      }}
-    }},
-    {{
-      "kind": "witness",
-      "concept": "{CONCEPT}",
-      "predicate": "no-assertion-tree",
-      "text": "The refusal is recorded in evidence/refusals.txt, so this claim carries no assertion tree at all.",
-      "channel": {{ "artefact": {{ "path": "evidence/refusals.txt", "sha256": "{artefact_hash}" }} }}
-    }},
-    {{
-      "kind": "ensures",
-      "symbol": "{SUBJECT}",
-      "concept": "{CONCEPT}",
-      "predicate": "empty-conjunction",
-      "text": "An empty conjunction asserts nothing, so no run can contradict it.",
-      "channel": {{ "scenario": "{SCENARIO}", "asserts": {{ "all": [] }} }}
-    }},
-    {{
-      "kind": "ensures",
-      "symbol": "{SUBJECT}",
-      "concept": "{CONCEPT}",
-      "predicate": "always-true-predicate",
-      "text": "exit_code is never negative, so this predicate holds of every run and divides no pair of outcomes.",
-      "channel": {{
-        "scenario": "{SCENARIO}",
-        "asserts": {{ "obs": "exit_code", "is": {{ "satisfies": {{ "source": "exit_code >= 0" }} }} }}
-      }}
-    }},
-    {{
-      "kind": "ensures",
-      "symbol": "{SUBJECT}",
-      "concept": "{CONCEPT}",
-      "predicate": "predicate-inside-conjunction",
-      "text": "One unevaluated predicate inside a conjunction is enough that the whole tree is not settled.",
-      "channel": {{
-        "scenario": "{SCENARIO}",
-        "asserts": {{
-          "all": [
-            {{ "obs": "exit_code", "is": {{ "equals": 2 }} }},
-            {{ "obs": "message", "is": {{ "satisfies": {{ "source": "message.len() > 0" }} }} }}
-          ]
-        }}
-      }}
-    }},
-    {{
-      "kind": "ensures",
-      "symbol": "{SUBJECT}",
-      "concept": "{CONCEPT}",
-      "predicate": "separates-the-refusal",
-      "text": "Comparing the exit code to 2 separates the refusal from every run that accepted the directory.",
-      "channel": {{
-        "scenario": "{SCENARIO}",
-        "asserts": {{ "all": [{{ "obs": "exit_code", "is": {{ "equals": 2 }} }}] }}
-      }}
     }}
   ]
 }}
@@ -325,17 +161,174 @@ fn claims(artefact_hash: &str) -> String {
     )
 }
 
-/// `veridoc-conformance.json`: the names the suite drives. The citation pair names the store and
-/// the log this project renders beside it, so `cite-schema` reads an answer out of a file the
+/// The index file's text, in the shape `project::index_text` reads back.
+fn index_body(tree: &str) -> String {
+    format!(
+        "// The document tree, created by `veridoc init` through the plugin. Edit it; do not \
+         regenerate it.\n\n/// The concepts and the documents this project declares, and the optional \
+         vocabulary. The plugin reads this item; `cargo` does not compile this file, because the index \
+         sits at the project root rather than under `src/`.\npub const {INDEX_ITEM}: &str = \
+         r##\"{tree}\"##;\n"
+    )
+}
+
+/// The artefact the `no-assertion-tree` witness points at. Its hash is computed as the fixture is
+/// rendered, so the claim cannot drift from the file beside it.
+const EVIDENCE: &str = "probe refused fixtures/empty-directory: holds no config.json\n";
+
+/// The fixture's claim module: the scenario claim the suite runs, the four structural negatives,
+/// and the one positive probe. Every predicate named in `veridoc-conformance.json` is declared here,
+/// because the suite looks each one up in the `collect` answer by predicate.
+fn claims(artefact_hash: &str) -> String {
+    format!(
+        r#"//! The fixture's claims about `src/probe.rs`, and the scenario each one carries.
+//!
+//! A scenario is code in this file. It calls the project directly, so no action name and no fixture
+//! registry stands between the claim and the call it makes (`docs/decisions/0006:57-74`), and two
+//! claims that need the same world call the same function (`docs/decisions/0006:81-85`).
+
+use veridoc_claims::{{Assert, Channel, Claim, Kind, Outcome, Scenario, Subject, Type}};
+
+/// The directory the run claims are made against: it holds no `config.json`.
+const EMPTY: &str = "{FIXTURE}";
+
+/// The two values every run claim declares, with the types its assertions are checked against.
+const VALUES: &[(&str, Type)] = &[("exit_code", Type::Number), ("message", Type::String)];
+
+/// The one world the run claims share: `probe` against a directory that holds no configuration.
+fn refusal() -> Result<Outcome, String> {{
+    let message = match veridoc_conformance_fixture::probe(std::path::Path::new(EMPTY)) {{
+        Ok(_) => return Err("probe accepted a directory that holds no config.json".to_string()),
+        Err(reason) => reason,
+    }};
+    Ok(Outcome::new().value("exit_code", 2).value("message", message))
+}}
+
+/// The same world, with the answer the `satisfies` leaf asks for. This plugin does not evaluate a
+/// Rust predicate, so the scenario answers it, keyed by the leaf's own source text, and `bivalence`
+/// reports the claim as not bivalent for that reason.
+fn refusal_exit_code_is_never_negative() -> Result<Outcome, String> {{
+    Ok(refusal()?.satisfied("exit_code >= 0", true))
+}}
+
+/// The same world again, answering the other predicate: one scenario function per leaf set, because
+/// the answer is keyed by the leaf's source and not by the claim.
+fn refusal_message_is_not_empty() -> Result<Outcome, String> {{
+    Ok(refusal()?.satisfied("message.len() > 0", true))
+}}
+
+/// The claims the suite drives.
+pub fn claims() -> Vec<Claim> {{
+    vec![
+        Claim {{
+            kind: Kind::Ensures,
+            subject: Subject::symbol("{SUBJECT}", "src/probe.rs"),
+            concept: "{CONCEPT}",
+            predicate: "refuses-missing-config",
+            text: "probe refuses a directory that holds no config.json: the run exits 2 and the \
+                   message names the file.",
+            channel: Channel::run(Assert::all([
+                Assert::eq("exit_code", 2),
+                Assert::has("message", "config.json"),
+            ])),
+            scenario: Some(Scenario {{
+                given: "a directory that holds no config.json",
+                when: "probe is called against it",
+                returns: VALUES,
+                run: refusal,
+            }}),
+        }},
+        Claim {{
+            kind: Kind::Witness,
+            subject: Subject::concept("{CONCEPT}"),
+            concept: "{CONCEPT}",
+            predicate: "no-assertion-tree",
+            text: "The refusal is recorded in evidence/refusals.txt, so this claim carries no \
+                   assertion tree at all.",
+            channel: Channel::Witness {{
+                path: "evidence/refusals.txt",
+                sha256: "{artefact_hash}",
+            }},
+            scenario: None,
+        }},
+        Claim {{
+            kind: Kind::Ensures,
+            subject: Subject::symbol("{SUBJECT}", "src/probe.rs"),
+            concept: "{CONCEPT}",
+            predicate: "empty-conjunction",
+            text: "An empty conjunction asserts nothing, so no run can contradict it.",
+            channel: Channel::run(Assert::all([])),
+            scenario: Some(Scenario {{
+                given: "a directory that holds no config.json",
+                when: "probe is called against it",
+                returns: VALUES,
+                run: refusal,
+            }}),
+        }},
+        Claim {{
+            kind: Kind::Ensures,
+            subject: Subject::symbol("{SUBJECT}", "src/probe.rs"),
+            concept: "{CONCEPT}",
+            predicate: "always-true-predicate",
+            text: "exit_code is never negative, so this predicate holds of every run and divides \
+                   no pair of outcomes.",
+            channel: Channel::run(Assert::satisfies("exit_code", "exit_code >= 0")),
+            scenario: Some(Scenario {{
+                given: "a directory that holds no config.json",
+                when: "probe is called against it",
+                returns: VALUES,
+                run: refusal_exit_code_is_never_negative,
+            }}),
+        }},
+        Claim {{
+            kind: Kind::Ensures,
+            subject: Subject::symbol("{SUBJECT}", "src/probe.rs"),
+            concept: "{CONCEPT}",
+            predicate: "predicate-inside-conjunction",
+            text: "One unevaluated predicate inside a conjunction is enough that the whole tree is \
+                   not settled.",
+            channel: Channel::run(Assert::all([
+                Assert::eq("exit_code", 2),
+                Assert::satisfies("message", "message.len() > 0"),
+            ])),
+            scenario: Some(Scenario {{
+                given: "a directory that holds no config.json",
+                when: "probe is called against it",
+                returns: VALUES,
+                run: refusal_message_is_not_empty,
+            }}),
+        }},
+        Claim {{
+            kind: Kind::Ensures,
+            subject: Subject::symbol("{SUBJECT}", "src/probe.rs"),
+            concept: "{CONCEPT}",
+            predicate: "separates-the-refusal",
+            text: "Comparing the exit code to 2 separates the refusal from every run that accepted \
+                   the directory.",
+            channel: Channel::run(Assert::all([Assert::eq("exit_code", 2)])),
+            scenario: Some(Scenario {{
+                given: "a directory that holds no config.json",
+                when: "probe is called against it",
+                returns: VALUES,
+                run: refusal,
+            }}),
+        }},
+    ]
+}}
+"#
+    )
+}
+
+/// `veridoc-conformance.json`: the names the suite drives. `scenarioClaim` is a predicate, because
+/// the suite finds the claim in the `collect` answer and then uses that claim's own id to address
+/// `run`; `values` names what that claim's scenario must answer. The citation pair names the store
+/// and the log this project renders beside it, so `cite-schema` reads an answer out of a file the
 /// emitter wrote rather than a name with nothing behind it.
 fn conformance_manifest() -> String {
     format!(
         r#"{{
   "scenarioClaim": "refuses-missing-config",
-  "scenarioId": "{SCENARIO}",
-  "fixture": "{FIXTURE}",
-  "action": "{ACTION}",
-  "observables": ["exit_code", "message"],
+  "values": ["exit_code", "message"],
   "citationStore": "{CITATION_STORE}",
   "citationId": "{CITATION_ID}",
   "citationTurn": {CITATION_TURN},
@@ -351,6 +344,28 @@ fn conformance_manifest() -> String {
     )
 }
 
+/// Where the plugin's claim library sits, so the rendered project can depend on it by path. The
+/// compile-time path is the checkout the emitter was built from, which is where the library lives
+/// when `veridoc install-plugin` builds a plugin from a checkout; the working-directory path is the
+/// fallback for a checkout moved after the build, which is also where the emitter's own tests run.
+fn claims_library() -> Result<PathBuf, String> {
+    let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("../veridoc-claims");
+    let checkout = Path::new("crates/veridoc-claims");
+    for candidate in [built.as_path(), checkout] {
+        if candidate.join("Cargo.toml").is_file() {
+            return candidate
+                .canonicalize()
+                .map_err(|e| format!("{} is not readable: {e}", candidate.display()));
+        }
+    }
+    Err(format!(
+        "no veridoc-claims crate at {} or {}, so the rendered project cannot depend on the claim \
+         library by path",
+        built.display(),
+        checkout.display()
+    ))
+}
+
 const SPEC_MD: &str = "\
 # The conformance fixture
 
@@ -361,8 +376,8 @@ const SPEC_MD: &str = "\
 `probe` refuses a directory that holds no `config.json` <doc-claim name=\"refuses-missing-config\"/>, and
 the message of the refusal names the directory it refused.
 
-The suite runs the one scenario this project declares and asks `bivalence` about the five claims that
-carry a predicate of their own.
+The suite runs the scenario of one claim and asks `bivalence` about the five claims that carry a
+predicate of their own.
 ";
 
 /// Render the fixture into `dir` and return `dir`. The directory is created if it is absent, and
@@ -373,14 +388,19 @@ pub fn render(dir: &Path) -> Result<PathBuf, String> {
         fs::remove_dir_all(dir)
             .map_err(|e| format!("{} could not be cleared: {e}", dir.display()))?;
     }
-    write(dir, "Cargo.toml", CARGO_TOML)?;
+    let claims_crate = claims_library()?;
+    write(
+        dir,
+        "Cargo.toml",
+        &cargo_toml(&claims_crate.display().to_string()),
+    )?;
     write(dir, "src/lib.rs", LIB_RS)?;
     write(dir, "src/probe.rs", PROBE_RS)?;
-    write(dir, &format!("src/bin/{HARNESS}.rs"), HARNESS_RS)?;
     let hash = hex_sha256(EVIDENCE.as_bytes());
     write(dir, "evidence/refusals.txt", EVIDENCE)?;
-    write(dir, "src/probe.claims.json", &claims(&hash))?;
-    write(dir, "veridoc.tree.json", &tree())?;
+    write(dir, CLAIM_MODULE, &claims(&hash))?;
+    write(dir, HARNESS_TARGET, HARNESS_RS)?;
+    write(dir, INDEX_FILE, &index_body(&tree()))?;
     write(dir, "veridoc-conformance.json", &conformance_manifest())?;
     write(dir, ".veridoc/config.json", &config())?;
     write(
@@ -429,26 +449,47 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
-    /// The three files the suite reads have to name one project. A predicate the manifest probes
-    /// and the sidecar does not declare reaches the author as `collect reported no claim with
-    /// predicate`, which points at the manifest rather than at the file that is wrong, and a stale
-    /// artefact hash reaches them as a red witness claim in a project they never wrote.
+    /// Read the rendered index back the way the plugin does: the JSON inside `VERIDOC_INDEX`.
+    fn index_json_at(root: &Path) -> Result<serde_json::Value, String> {
+        let text = fs::read_to_string(root.join(INDEX_FILE))
+            .map_err(|e| format!("the rendered index is unreadable: {e}"))?;
+        let body = text
+            .split_once("r##\"")
+            .ok_or("the rendered index holds no raw string")?
+            .1
+            .split_once("\"##")
+            .ok_or("the rendered index raw string is never closed")?
+            .0;
+        serde_json::from_str(body).map_err(|e| format!("the rendered index is not readable: {e}"))
+    }
+
+    /// The rendered files have to name one project. A predicate the manifest probes and the claim
+    /// module does not declare reaches the author as `collect reported no claim with predicate`,
+    /// which points at the manifest rather than at the file that is wrong, and a stale artefact hash
+    /// reaches them as a red witness claim in a project they never wrote.
     #[test]
     fn the_rendered_files_name_one_project() {
         let dir = std::env::temp_dir().join(format!("veridoc-emitter-test-{}", std::process::id()));
         let outcome = (|| -> Result<(), String> {
             render(&dir)?;
             let manifest = json_at(&dir, "veridoc-conformance.json")?;
-            let tree = json_at(&dir, "veridoc.tree.json")?;
-            let sidecar = json_at(&dir, "src/probe.claims.json")?;
+            let index = index_json_at(&dir)?;
+            let module = fs::read_to_string(dir.join(CLAIM_MODULE))
+                .map_err(|e| format!("{CLAIM_MODULE} is unreadable: {e}"))?;
 
-            let claims = sidecar["claims"]
-                .as_array()
-                .ok_or("the sidecar declares no claims array")?;
-            let declared: Vec<&str> = claims
-                .iter()
-                .filter_map(|claim| claim["predicate"].as_str())
-                .collect();
+            // The index holds the document tree and the concepts and nothing else (`0006:83`).
+            let keys: Vec<&str> = index
+                .as_object()
+                .map(|entries| entries.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            if keys != ["concepts", "documents"] {
+                return Err(format!(
+                    "the index declares {keys:?}, which is not the concepts and the document tree \
+                     alone"
+                ));
+            }
+
+            let declared = quoted_after(&module, "predicate: ");
             let probes = manifest["bivalence"]
                 .as_array()
                 .ok_or("the manifest names no bivalence probes")?;
@@ -463,87 +504,49 @@ mod tests {
                 }
             }
 
+            // The claim the suite runs must carry its own scenario, and that scenario must return
+            // the values the manifest says the run answers.
             let scenario_claim = manifest["scenarioClaim"]
                 .as_str()
                 .ok_or("the manifest names no scenario claim")?;
-            let scenario_id = manifest["scenarioId"]
-                .as_str()
-                .ok_or("the manifest names no scenario id")?;
-            let run = claims
-                .iter()
-                .find(|claim| claim["predicate"].as_str() == Some(scenario_claim))
-                .ok_or_else(|| format!("no claim declares predicate {scenario_claim:?}"))?;
-            if run["channel"]["scenario"].as_str() != Some(scenario_id) {
-                return Err(format!(
-                    "claim {scenario_claim:?} declares {:?}, but the suite asks for {scenario_id:?}",
-                    run["channel"]["scenario"].as_str()
-                ));
+            if !module.contains(&format!("predicate: \"{scenario_claim}\",")) {
+                return Err(format!("no claim declares predicate {scenario_claim:?}"));
             }
-
-            let action = manifest["action"]
-                .as_str()
-                .ok_or("the manifest names no action")?;
-            let actions = tree["actions"]
+            if !module.contains("scenario: Some(Scenario") {
+                return Err("no claim of this project carries a scenario".to_string());
+            }
+            let values = manifest["values"]
                 .as_array()
-                .ok_or("the tree declares no actions")?;
-            if !actions
-                .iter()
-                .any(|entry| entry["name"].as_str() == Some(action))
-            {
-                return Err(format!("the tree declares no action {action:?}"));
-            }
-            let fixture = manifest["fixture"]
-                .as_str()
-                .ok_or("the manifest names no fixture")?;
-            let fixtures = tree["fixtures"]
-                .as_array()
-                .ok_or("the tree declares no fixtures")?;
-            if !fixtures.iter().any(|entry| entry.as_str() == Some(fixture)) {
-                return Err(format!("the tree declares no fixture {fixture:?}"));
-            }
-            if !dir.join(fixture).is_dir() {
-                return Err(format!("the fixture directory {fixture:?} is not rendered"));
-            }
-            let harness = tree["harness"]
-                .as_str()
-                .ok_or("the tree declares no harness")?;
-            if !dir.join(format!("src/bin/{harness}.rs")).is_file() {
-                return Err(format!(
-                    "the tree names harness {harness:?}, which is not rendered"
-                ));
-            }
-            let observed = manifest["observables"]
-                .as_array()
-                .ok_or("the manifest names no observables")?;
-            let vocabulary = tree["observables"]
-                .as_array()
-                .ok_or("the tree declares no observables")?;
-            for entry in observed {
-                let name = entry.as_str().ok_or("an observable is not a name")?;
-                if !vocabulary
-                    .iter()
-                    .any(|declared| declared["name"].as_str() == Some(name))
-                {
+                .ok_or("the manifest names no values")?;
+            for entry in values {
+                let name = entry.as_str().ok_or("a value is not a name")?;
+                if !module.contains(&format!("(\"{name}\", Type::")) {
                     return Err(format!(
-                        "the manifest observes {name:?}, which the tree does not declare"
+                        "the manifest observes {name:?}, which no scenario declares it returns"
                     ));
                 }
             }
 
-            let artefact = claims
-                .iter()
-                .filter_map(|claim| claim["channel"]["artefact"].as_object())
-                .next()
-                .ok_or("no claim carries an artefact")?;
-            let path = artefact["path"]
-                .as_str()
-                .ok_or("the artefact names no path")?;
-            let want = artefact["sha256"]
-                .as_str()
-                .ok_or("the artefact names no hash")?;
+            if !dir.join(FIXTURE).is_dir() {
+                return Err(format!("the asset directory {FIXTURE:?} is not rendered"));
+            }
+            let harness = fs::read_to_string(dir.join(HARNESS_TARGET))
+                .map_err(|e| format!("{HARNESS_TARGET} is unreadable: {e}"))?;
+            if !harness.contains("#[path = \"../src/probe.doc.rs\"]") {
+                return Err(format!(
+                    "the harness does not name {CLAIM_MODULE}, so its claims are never listed"
+                ));
+            }
+
+            let artefacts = quoted_after(&module, "sha256: ");
+            let want = artefacts.first().ok_or("no claim pins an artefact hash")?;
+            let path = quoted_after(&module, "path: ")
+                .into_iter()
+                .find(|name| name.ends_with(".txt"))
+                .ok_or("no claim names an artefact path")?;
             let bytes =
                 fs::read(dir.join(path)).map_err(|e| format!("{path} is unreadable: {e}"))?;
-            if hex_sha256(&bytes) != want {
+            if hex_sha256(&bytes) != *want {
                 return Err(format!(
                     "{path} does not hash to the {want} the claim records"
                 ));
@@ -640,5 +643,25 @@ mod tests {
         let text = fs::read_to_string(&path)
             .map_err(|e| format!("{} is unreadable: {e}", path.display()))?;
         serde_json::from_str(&text).map_err(|e| format!("{relative} is not valid JSON: {e}"))
+    }
+
+    /// The string values that follow one key in the rendered claim module. The module is Rust, and
+    /// the emitter writes one `predicate: "..."` per claim, so the names are readable without a Rust
+    /// parser. The plugin reads them from the compiled binary instead; this check only needs the
+    /// names the source states, so it can run without building the fixture.
+    fn quoted_after<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
+        let mut found = Vec::new();
+        let mut rest = text;
+        while let Some(at) = rest.find(key) {
+            let tail = &rest[at + key.len()..];
+            let Some(open) = tail.find('"') else { break };
+            let after_open = &tail[open + 1..];
+            let Some(close) = after_open.find('"') else {
+                break;
+            };
+            found.push(&after_open[..close]);
+            rest = &after_open[close..];
+        }
+        found
     }
 }

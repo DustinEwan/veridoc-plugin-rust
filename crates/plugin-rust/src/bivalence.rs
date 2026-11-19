@@ -22,7 +22,7 @@ pub fn bivalence(project: &Project, claim_name: &str) -> Value {
     let Some(claim) = project
         .claims
         .iter()
-        .find(|candidate| project.claim_name(candidate) == claim_name)
+        .find(|candidate| candidate.id == claim_name)
     else {
         return json!({
             "bivalent": false,

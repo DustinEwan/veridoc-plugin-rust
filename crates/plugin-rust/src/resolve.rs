@@ -34,7 +34,7 @@ pub struct ResolveResult {
     pub unresolved: Vec<UnresolvedRef>,
 }
 
-/// Settle every reference. `concepts` is the vocabulary the project declares, so a claim about an
+/// Settle every reference. `concepts` is what the project's index declares, so a claim about an
 /// undeclared concept is reported as unresolved rather than answered with an invented identity.
 pub fn resolve(root: &Path, refs: &[String], concepts: &[String]) -> ResolveResult {
     let mut resolved = Vec::new();
@@ -60,7 +60,7 @@ pub fn resolve(root: &Path, refs: &[String], concepts: &[String]) -> ResolveResu
         } else {
             unresolved.push(UnresolvedRef {
                 r#ref: reference.clone(),
-                reason: format!("the vocabulary file declares no concept {name:?}"),
+                reason: format!("the index declares no concept {name:?}"),
             });
         }
     }

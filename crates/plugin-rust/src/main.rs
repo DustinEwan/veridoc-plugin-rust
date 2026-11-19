@@ -200,7 +200,7 @@ fn dispatch(line: &str, root: &mut Option<PathBuf>) -> Response {
                 return Response::refusal(
                     request.id,
                     PLUGIN_ERROR,
-                    "collect has not run, so there is no vocabulary to run a scenario from",
+                    "collect has not run, so there is no claim set to run a scenario from",
                 );
             };
             let params = match run_params(&request) {
@@ -298,65 +298,26 @@ fn param_citations(request: &Request) -> Result<Vec<cite::Citation>, String> {
 }
 
 /// The `run` parameters. A missing or mistyped field is an invalid request rather than a run
-/// failure, because `run-request.json` fixes the shape and a plugin that guesses which scenario
-/// the engine meant reports a verdict for the wrong claim.
+/// failure, because `run-request.json` fixes the shape and a plugin that guesses which claim the
+/// engine meant reports a verdict for the wrong claim. The claim is addressed by name: the scenario
+/// belongs to the claim and has no identity of its own (`docs/decisions/0006:50-55`).
 fn run_params(request: &Request) -> Result<run::Request, String> {
-    const MISSING: &str = "run requires scenarioId, fixture, action, args, deadlineMs, and leaves";
+    const MISSING: &str = "run requires claim and timeoutMs";
     let Some(params) = request.params.as_ref() else {
         return Err(MISSING.to_string());
     };
-    let text = |key: &str| {
-        params
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    };
-    let (Some(scenario_id), Some(fixture), Some(action)) =
-        (text("scenarioId"), text("fixture"), text("action"))
-    else {
-        return Err(MISSING.to_string());
-    };
-    let args = strings(params, "args")?;
-    let deadline_ms = params
-        .get("deadlineMs")
+    let claim = params
+        .get("claim")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(MISSING)?;
+    let timeout_ms = params
+        .get("timeoutMs")
         .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| format!("{MISSING}; deadlineMs must be a number"))?;
-    let leaves = params
-        .get("leaves")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| format!("{MISSING}; leaves must be an array of objects"))?
-        .iter()
-        .map(|leaf| {
-            leaf.get("leafId")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| "each leaf must carry a leafId".to_string())
-        })
-        .collect::<Result<Vec<String>, String>>()?;
+        .ok_or_else(|| format!("{MISSING}; timeoutMs must be a number"))?;
     Ok(run::Request {
-        scenario_id,
-        fixture,
-        action,
-        args,
-        deadline_ms,
-        leaves,
+        claim: claim.to_string(),
+        timeout_ms,
     })
-}
-
-/// One array-of-strings parameter, read from an already-held `params` object.
-fn strings(params: &serde_json::Value, key: &str) -> Result<Vec<String>, String> {
-    params
-        .get(key)
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| format!("{key} must be an array of strings"))?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| format!("{key} must be an array of strings"))
-        })
-        .collect()
 }
 
 /// One array-of-strings parameter.
